@@ -18,13 +18,29 @@ This library does not sign or submit transactions.
 
 ## Install
 
-Use Rust **1.88 or newer** and pin the release in your application's `Cargo.toml`:
+Use Rust **1.88 or newer**. For a new application, pin the release and enable
+Rust-version-aware dependency selection in `Cargo.toml`:
 
 ```toml
+[package]
+name = "thogamm-example"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+resolver = "3"
+
 [dependencies]
 state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.1.0" }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
 ```
+
+Cargo uses the **consuming application's** resolver and lockfile; it does not
+inherit a Git dependency's lockfile or `.cargo/config.toml`. In an existing
+workspace, set `resolver = "3"` in its root `[workspace]` and declare the intended
+`rust-version` on the consuming package. This prevents fresh resolution from
+choosing newer transitive dependencies that require a newer compiler than the
+stated minimum. See [Cargo's Rust-version-aware resolver](https://doc.rust-lang.org/edition-guide/rust-2024/cargo-resolver.html).
+The SDK repository itself already includes the matching configuration and lockfile.
 
 The GitHub repository is named `thog-amm-poll-sdk`; the Rust crate remains `state-poll-sdk` and
 imports as `state_poll_sdk`. Git installation resolves the workspace package.
