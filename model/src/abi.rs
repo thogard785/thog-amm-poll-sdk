@@ -1,4 +1,4 @@
-//! Typed ABI for schema 6. Layouts and event signatures match the Solidity sources.
+//! ThogAMM contract calls, responses and events used by the SDK.
 use alloy_sol_types::sol;
 sol! {
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -1,6 +1,6 @@
 [package]
 name = "thogamm-model"
-description = "Exact integer ThogAMM state and quote model"
+description = "Local ThogAMM quote calculation and pool state for aggregator integrations"
 readme = "../README.md"
 version.workspace = true
 edition.workspace = true

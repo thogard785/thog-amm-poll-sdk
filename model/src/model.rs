@@ -23,19 +23,6 @@ pub struct Limits {
     pub sell: U256,
     pub buy: U256,
 }
-/// Transaction-local FastLane warmth is an explicit input, never inferred from logs.
-#[derive(Clone, Debug)]
-pub struct ExecutionContext {
-    /// Effective tx.gasprice in wei, not maxFeePerGas. For EIP-1559:
-    /// min(maxFeePerGas, execution block base fee + maxPriorityFeePerGas).
-    pub gas_price: U256,
-    pub fast_lane_hot: bool,
-}
-impl ExecutionContext {
-    fn friction(&self, base_fee: U256) -> Result<bool> {
-        Ok(self.gas_price > mul(u(2), base_fee)? || self.fast_lane_hot)
-    }
-}
 #[derive(Clone, Debug)]
 pub struct PoolModel {
     state: Arc<PoolState>,
@@ -143,30 +130,33 @@ impl PoolModel {
         }
         self.prepare(input, output)?.quote_exact_input(amount)
     }
-    /// Executable sell pricing, with transaction context and settlement inventory headroom.
+    /// Quote the output for an input amount, including balance and exposure limits.
+    /// `gas_price` is the transaction's effective gas price in wei, not its fee cap.
+    /// Prices include the pool's additional spread when it exceeds twice the block base fee.
     pub fn quote_execution_exact_input(
         &self,
         input: Address,
         output: Address,
         amount: U256,
-        execution: &ExecutionContext,
+        gas_price: U256,
     ) -> Result<Quote> {
         if amount.is_zero() {
             return Err(Error::Unavailable("zero fill"));
         }
         self.prepare(input, output)?
-            .quote_execution_exact_input(amount, execution)
+            .quote_execution_exact_input(amount, gas_price)
     }
-    /// Matches the ERC-7815 Buy solver. Integer surplus remains in pool inventory.
+    /// Quote the input needed for an exact output amount using contract rounding.
+    /// `gas_price` is the transaction's effective gas price in wei, not its fee cap.
     pub fn quote_exact_output(
         &self,
         input: Address,
         output: Address,
         amount: U256,
-        execution: &ExecutionContext,
+        gas_price: U256,
     ) -> Result<Quote> {
         self.prepare(input, output)?
-            .quote_exact_output(amount, execution)
+            .quote_exact_output(amount, gas_price)
     }
     /// ERC-7815 price(): raw output units per raw input unit, at the specified input.
     pub fn marginal_price(
@@ -418,17 +408,15 @@ impl PreparedPair<'_> {
         self.model.check_balance(&self.curve, &quote)?;
         Ok(quote)
     }
-    pub fn quote_execution_exact_input(
-        &self,
-        amount: U256,
-        execution: &ExecutionContext,
-    ) -> Result<Quote> {
+    /// Quote an input amount with balance and exposure checks, reusing this pair's calculations.
+    /// `gas_price` is the transaction's effective gas price in wei.
+    pub fn quote_execution_exact_input(&self, amount: U256, gas_price: U256) -> Result<Quote> {
         if amount.is_zero() {
             return Err(Error::Unavailable("zero fill"));
         }
         let quote = self.curve.quote(
             amount,
-            execution.friction(self.model.quote_base_fee_per_gas)?,
+            gas_price > mul(u(2), self.model.quote_base_fee_per_gas)?,
         )?;
         if quote.amount_out.is_zero() {
             return Err(Error::Unavailable("zero fill"));
@@ -437,7 +425,8 @@ impl PreparedPair<'_> {
         self.model.check_exposure(&self.curve, &quote)?;
         Ok(quote)
     }
-    pub fn quote_exact_output(&self, amount: U256, execution: &ExecutionContext) -> Result<Quote> {
+    /// Quote the input for an exact output amount. `gas_price` is the effective price in wei.
+    pub fn quote_exact_output(&self, amount: U256, gas_price: U256) -> Result<Quote> {
         let limits = self.limits()?;
         if amount > limits.buy {
             return Err(Error::LimitExceeded(limits.buy));
@@ -445,7 +434,7 @@ impl PreparedPair<'_> {
         if amount.is_zero() {
             return self.curve.quote(U256::ZERO, false);
         }
-        let friction = execution.friction(self.model.quote_base_fee_per_gas)?;
+        let friction = gas_price > mul(u(2), self.model.quote_base_fee_per_gas)?;
         let mut quote = self.curve.solve_output(amount, limits.sell, friction)?;
         quote.amount_out = amount;
         self.model.check_exposure(&self.curve, &quote)?;

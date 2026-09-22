@@ -4,7 +4,7 @@ use alloy_sol_types::SolValue;
 use thogamm_model::{
     events,
     math::{mask, u},
-    Error, ExecutionContext, PoolModel, PoolState, U256,
+    Error, PoolModel, PoolState, U256,
 };
 
 #[test]
@@ -25,20 +25,23 @@ fn projected_quotes_preserve_provenance_and_use_the_requested_block_context() {
         .unwrap()
         .quote_exact_input(a, b, amount)
         .is_err());
-    let context = ExecutionContext {
-        gas_price: f.baseFee * u(2) + U256::ONE,
-        fast_lane_hot: false,
-    };
+    let gas_price = f.baseFee * u(2) + U256::ONE;
     // This effective gas price is below twice the projected block's base fee.
     assert_eq!(
-        next.quote_execution_exact_input(a, b, amount, &context)
+        next.quote_execution_exact_input(a, b, amount, gas_price)
             .unwrap()
             .amount_out,
         next.quote_exact_input(a, b, amount).unwrap().amount_out
     );
     let high = model.at_block(n + 1, f.baseFee).unwrap();
+    assert_eq!(
+        high.quote_execution_exact_input(a, b, amount, f.baseFee * u(2))
+            .unwrap()
+            .amount_out,
+        high.quote_exact_input(a, b, amount).unwrap().amount_out
+    );
     assert!(
-        high.quote_execution_exact_input(a, b, amount, &context)
+        high.quote_execution_exact_input(a, b, amount, gas_price)
             .unwrap()
             .amount_out
             < high.quote_exact_input(a, b, amount).unwrap().amount_out
@@ -62,12 +65,13 @@ fn quotes_match_solidity_across_legacy_and_64_token_images() {
             support::model(f.proxy, f.baseFee, &set.snapshot)
         };
         for (case, s) in set.quotes.iter().enumerate() {
+            // Aggregator execution assumes no transaction-local account warmth.
+            // Retain the fixture's cold cases at low, threshold and high gas prices.
+            if s.kind >= 3 && s.fastLaneHot {
+                continue;
+            }
             let a = model.state().tokens[s.inputIndex as usize].token;
             let b = model.state().tokens[s.outputIndex as usize].token;
-            let context = ExecutionContext {
-                gas_price: s.gasPrice,
-                fast_lane_hot: s.fastLaneHot,
-            };
             let got: thogamm_model::Result<Vec<U256>> = match s.kind {
                 0 => model
                     .quote_exact_input(a, b, s.amount)
@@ -77,10 +81,10 @@ fn quotes_match_solidity_across_legacy_and_64_token_images() {
                     .map(|q| vec![q.numerator, q.denominator]),
                 2 => model.limits(a, b).map(|q| vec![q.sell, q.buy]),
                 3 => model
-                    .quote_execution_exact_input(a, b, s.amount, &context)
+                    .quote_execution_exact_input(a, b, s.amount, s.gasPrice)
                     .map(|q| vec![q.amount_out]),
                 4 => model
-                    .quote_exact_output(a, b, s.amount, &context)
+                    .quote_exact_output(a, b, s.amount, s.gasPrice)
                     .map(|q| vec![q.amount_in]),
                 _ => panic!("unknown sample"),
             };
@@ -93,10 +97,10 @@ fn quotes_match_solidity_across_legacy_and_64_token_images() {
                     .map(|q| vec![q.numerator, q.denominator]),
                 2 => pair.limits().map(|q| vec![q.sell, q.buy]),
                 3 => pair
-                    .quote_execution_exact_input(s.amount, &context)
+                    .quote_execution_exact_input(s.amount, s.gasPrice)
                     .map(|q| vec![q.amount_out]),
                 4 => pair
-                    .quote_exact_output(s.amount, &context)
+                    .quote_exact_output(s.amount, s.gasPrice)
                     .map(|q| vec![q.amount_in]),
                 _ => unreachable!(),
             });
@@ -138,7 +142,7 @@ fn quotes_match_solidity_across_legacy_and_64_token_images() {
             );
         }
     }
-    assert!(tested.iter().all(|n| *n == 1024));
+    assert_eq!(tested, [1024, 1024, 1024, 872, 872]);
     assert!(successes.iter().all(|n| *n > 100));
     println!("Solidity cases by surface: {tested:?}; exact-value successes: {successes:?}");
 }
@@ -255,15 +259,7 @@ fn quote_guards_and_inventory_boundaries_match_contract_rules() {
     // Read-only maker quoting does not run settlement's signed inventory checks.
     assert!(m.quote_exact_input(a, b, u(1_000_000)).is_ok());
     assert!(m
-        .quote_execution_exact_input(
-            a,
-            b,
-            u(1_000_000),
-            &ExecutionContext {
-                gas_price: U256::ZERO,
-                fast_lane_hot: false
-            }
-        )
+        .quote_execution_exact_input(a, b, u(1_000_000), U256::ZERO)
         .is_err());
 }
 #[test]
@@ -298,15 +294,7 @@ fn signed_delta_bound_is_independent_of_resulting_inventory_headroom() {
     assert!(model.limits(a, b).unwrap().sell >= amount);
     assert!(model.quote_exact_input(a, b, amount).is_ok());
     assert!(matches!(
-        model.quote_execution_exact_input(
-            a,
-            b,
-            amount,
-            &ExecutionContext {
-                gas_price: U256::ZERO,
-                fast_lane_hot: false
-            }
-        ),
+        model.quote_execution_exact_input(a, b, amount, U256::ZERO),
         Err(Error::Unavailable("exposure overflow"))
     ));
 }

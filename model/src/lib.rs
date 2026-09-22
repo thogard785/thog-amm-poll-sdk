@@ -1,5 +1,5 @@
-//! Deterministic, integer-only ThogAMM schema-6 pricing and synchronization primitives.
-//! Quote results describe the attached block. No RPC is performed by the quote engine.
+//! Calculate ThogAMM quotes locally from pool state using exact integer arithmetic.
+//! Quotes describe the snapshot's block and perform no network calls.
 pub mod abi;
 pub mod events;
 pub mod math;
@@ -8,7 +8,7 @@ pub mod rpc;
 pub mod state;
 
 pub use alloy_primitives::{Address, Bytes, B256, I256, U256};
-pub use model::{ExecutionContext, Fraction, Limits, PoolModel, PreparedPair, Quote};
+pub use model::{Fraction, Limits, PoolModel, PreparedPair, Quote};
 pub use state::{BlockContext, BlockHeader, PoolState, RpcLog};
 
 #[derive(Debug, thiserror::Error)]
@@ -17,7 +17,7 @@ pub enum Error {
     InvalidData(String),
     #[error("missing storage word {0}")]
     MissingWord(u16),
-    #[error("unsupported pool schema {0}")]
+    #[error("unsupported ThogAMM state format {0}; obtain the matching SDK release from ThogAMM")]
     UnsupportedSchema(u16),
     #[error("unknown token {0}")]
     UnknownToken(Address),
@@ -35,9 +35,11 @@ pub enum Error {
     Transport(String),
     #[error("ABI error: {0}")]
     Abi(String),
-    #[error("subscription stream is discontinuous or failed; explicitly reinitialize from complete state")]
+    #[error("ThogAMM subscription lost continuity; reconnect to load current pool state")]
     Discontinuous,
-    #[error("contract upgraded; verify the new implementation and explicitly initialize a compatible SDK")]
+    #[error(
+        "ThogAMM was upgraded; obtain the supported SDK release from ThogAMM before reconnecting"
+    )]
     ContractUpgraded,
 }
 pub type Result<T> = std::result::Result<T, Error>;

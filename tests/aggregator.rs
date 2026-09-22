@@ -2,9 +2,7 @@
 mod support;
 
 use alloy_sol_types::SolCall;
-use state_poll_sdk::{
-    decode_pool_data, pool_data_params, snapshot, CallBlock, ExecutionContext, U256,
-};
+use state_poll_sdk::{decode_pool_data, pool_data_params, snapshot, CallBlock, U256};
 use thogamm_model::{abi, Error};
 
 #[test]
@@ -18,10 +16,6 @@ fn externally_fetched_state_supports_all_quote_surfaces_without_a_reader() {
     for sample in &set.quotes {
         let a = model.state().tokens[sample.inputIndex as usize].token;
         let b = model.state().tokens[sample.outputIndex as usize].token;
-        let context = ExecutionContext {
-            gas_price: sample.gasPrice,
-            fast_lane_hot: sample.fastLaneHot,
-        };
         let actual = model.prepare(a, b);
         match sample.kind {
             0 => assert_eq!(
@@ -39,24 +33,28 @@ fn externally_fetched_state_supports_all_quote_surfaces_without_a_reader() {
                 format!("{:?}", actual.and_then(|p| p.limits())),
                 format!("{:?}", reference.limits(a, b))
             ),
-            3 => assert_eq!(
-                format!(
-                    "{:?}",
-                    actual.and_then(|p| p.quote_execution_exact_input(sample.amount, &context))
-                ),
-                format!(
-                    "{:?}",
-                    reference.quote_execution_exact_input(a, b, sample.amount, &context)
+            3 => {
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        actual.and_then(
+                            |p| p.quote_execution_exact_input(sample.amount, sample.gasPrice)
+                        )
+                    ),
+                    format!(
+                        "{:?}",
+                        reference.quote_execution_exact_input(a, b, sample.amount, sample.gasPrice)
+                    )
                 )
-            ),
+            }
             4 => assert_eq!(
                 format!(
                     "{:?}",
-                    actual.and_then(|p| p.quote_exact_output(sample.amount, &context))
+                    actual.and_then(|p| p.quote_exact_output(sample.amount, sample.gasPrice))
                 ),
                 format!(
                     "{:?}",
-                    reference.quote_exact_output(a, b, sample.amount, &context)
+                    reference.quote_exact_output(a, b, sample.amount, sample.gasPrice)
                 )
             ),
             _ => unreachable!(),
