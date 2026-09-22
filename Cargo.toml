@@ -1,9 +1,31 @@
+[package]
+name = "state-poll-sdk"
+description = "Deterministic ThogAMM quotes with one state call per update"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thogamm-model = { path = "model" }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+alloy-sol-types.workspace = true
+async-trait.workspace = true
+flate2.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [workspace]
-members = ["thogamm-model", "state-poll-sdk"]
-resolver = "2"
+members = ["model"]
+resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 publish = false
@@ -13,16 +35,11 @@ repository = "https://github.com/thogard785/thog-amm-poll-sdk"
 [workspace.dependencies]
 alloy-primitives = { version = "=1.7.3", features = ["serde"] }
 alloy-sol-types = "=1.7.3"
-flate2 = "1.1"
 async-trait = "0.1.89"
-futures-util = { version = "0.3.31", features = ["sink"] }
-reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+flate2 = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-thiserror = "2.0"
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "net", "sync", "io-util"] }
-tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
-thogamm-model = { path = "thogamm-model" }
+tokio = "1.48"
 
 [profile.release]
 overflow-checks = true

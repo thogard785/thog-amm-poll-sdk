@@ -1,4 +1,4 @@
-#[path = "../../fixtures/support.rs"]
+#[path = "common/mod.rs"]
 mod support;
 
 use alloy_sol_types::SolCall;

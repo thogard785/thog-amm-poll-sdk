@@ -1,4 +1,4 @@
-#[path = "../../fixtures/support.rs"]
+#[path = "common/mod.rs"]
 mod support;
 use state_poll_sdk::{Config, StatePollSdk};
 use thogamm_model::{rpc::CallBlock, Error, U256};

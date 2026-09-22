@@ -1,4 +1,4 @@
-#[path = "../../fixtures/support.rs"]
+#[path = "../../tests/common/mod.rs"]
 mod support;
 use alloy_sol_types::SolCall;
 use serde_json::{json, Value};
