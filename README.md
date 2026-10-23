@@ -28,24 +28,39 @@ Pass your Monad HTTP RPC URL, the ThogAMM pool address above, the two token
 addresses, an input amount and your transaction's effective gas price in wei:
 
 ```rust
-use state_poll_sdk::{Address, Config, Result, StatePollSdk, U256};
+use state_poll_sdk::{Address, Config, Error, Result, StatePollSdk, U256};
+use std::time::Duration;
 
-async fn follow_quotes(
-    rpc: &str,
-    pool: Address,
-    token_in: Address,
-    token_out: Address,
-    amount_in: U256,
-    gas_price: U256,
-) -> Result<()> {
-    let mut sdk = StatePollSdk::connect(rpc, pool, Config::default()).await?;
-    loop {
-        let model = sdk.model()?;
-        match model.quote_execution_exact_input(token_in, token_out, amount_in, gas_price) {
-            Ok(quote) => println!("amount_out={}", quote.amount_out),
-            Err(error) => eprintln!("quote unavailable: {error}"),
+async fn follow_quotes(http_rpc: &str, pool: Address, token_in: Address,
+    token_out: Address, amount_in: U256, gas_price: U256) -> Result<()> {
+    let mut delay = Duration::from_millis(250);
+    let mut sdk = loop {
+        match StatePollSdk::connect(http_rpc, pool, Config::default()).await {
+            Ok(sdk) => break sdk,
+            Err(error @ (Error::Transport(_) | Error::Rpc(_))) => {
+                eprintln!("connect failed: {error}; retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
+            }
+            Err(error) => return Err(error),
         }
-        sdk.next_update().await?;
+    };
+    loop {
+        match sdk.next_update().await {
+            Ok(model) => {
+                delay = Duration::from_millis(250);
+                match model.quote_execution_exact_input(token_in, token_out, amount_in, gas_price) {
+                    Ok(q) => println!("block={} amount_out={}", model.state().block.number, q.amount_out),
+                    Err(error) => eprintln!("quote unavailable: {error}"),
+                }
+            }
+            Err(error @ (Error::Transport(_) | Error::Rpc(_) | Error::ProviderBehind { .. })) => {
+                eprintln!("refresh failed: {error}; retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 ```
@@ -55,6 +70,10 @@ exactly one call. `next_update()` refreshes on a 250 ms cadence by default,
 without adding the RPC duration to each interval or bursting to catch up.
 If you already follow chain heads, call `refresh()` for each new block. These updates include all listed tokens and
 require no additional header, balance or token-discovery calls.
+
+The example retries transient connection/RPC failures with capped exponential
+backoff and reports every failure. Invalid snapshots or unsupported formats
+stop it for investigation. Each SDK refresh itself still makes one request.
 
 You control when to update. Quote methods are synchronous and make no network
 calls. A failed refresh returns its cause and makes `sdk.model()` unavailable
