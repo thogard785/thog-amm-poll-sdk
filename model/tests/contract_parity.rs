@@ -122,3 +122,46 @@ fn deployed_publications_preserve_spare_bits_and_replay_caps_and_readiness() {
     }
     assert_eq!(stages.len(), 3);
 }
+
+#[test]
+fn wmon_checkpoint_checks_replayed_wmon_without_claiming_other_token_coverage() {
+    use alloy_sol_types::SolEvent;
+    use thogamm_model::{abi, state::WMON, Error, RpcLog};
+    let f = support::fixture();
+    let model = support::model(f.proxy, f.baseFee, &f.samples[0].snapshot);
+    let wmon_index = model.index(WMON).unwrap();
+    let h = support::header(model.state().block.number + 1, f.baseFee);
+    let transfer = abi::Transfer {
+        from: thogamm_model::Address::ZERO,
+        to: f.proxy,
+        value: u(7),
+    }
+    .encode_log_data();
+    let checkpoint = abi::MakerWmonBalanceCheckpoint {
+        balance: model.state().balances[wmon_index] + u(7),
+    }
+    .encode_log_data();
+    let logs: Vec<_> = [(WMON, transfer), (f.proxy, checkpoint)]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (address, event))| RpcLog {
+            address,
+            topics: event.topics().to_vec(),
+            data: event.data,
+            block_hash: h.hash,
+            block_number: h.number,
+            transaction_index: 0,
+            log_index: i as u64,
+            removed: false,
+        })
+        .collect();
+    let next = events::apply_block(model.state(), h.clone(), &logs).unwrap();
+    assert_eq!(
+        next.balances[wmon_index],
+        model.state().balances[wmon_index] + u(7)
+    );
+    assert!(matches!(
+        events::apply_block(model.state(), h, &logs[1..]),
+        Err(Error::BalanceCheckpointMismatch { token: WMON, .. })
+    ));
+}

@@ -238,7 +238,14 @@ pub fn apply_owned_block<'a>(
                     .iter()
                     .position(|t| t.token == crate::state::WMON)
                     .ok_or_else(invalid)?;
-                next.balances[i] = decode::<abi::MakerWmonBalanceCheckpoint>(log)?.balance;
+                let observed = decode::<abi::MakerWmonBalanceCheckpoint>(log)?.balance;
+                if next.balances[i] != observed {
+                    return Err(Error::BalanceCheckpointMismatch {
+                        token: crate::state::WMON,
+                        expected: next.balances[i],
+                        observed,
+                    });
+                }
             } else if *topic == abi::NativeBalanceCheckpoint::SIGNATURE_HASH {
                 next.native_balance = decode::<abi::NativeBalanceCheckpoint>(log)?.balance;
             } else if *topic == abi::Paused::SIGNATURE_HASH {

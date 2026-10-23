@@ -14,6 +14,12 @@ pub use state::{BlockContext, BlockHeader, PoolState, RpcLog};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("balance checkpoint mismatch for {token}: replayed {expected}, onchain {observed}; rebuild complete state")]
+    BalanceCheckpointMismatch {
+        token: Address,
+        expected: U256,
+        observed: U256,
+    },
     #[error("live state is unavailable after a failed or cancelled update; obtain a complete successful update")]
     SnapshotUnavailable,
     #[error("snapshot BASEFEE is zero; fetch Monad pool state with a nonzero eth_call gasPrice")]
