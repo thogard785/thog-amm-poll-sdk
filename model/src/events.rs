@@ -4,21 +4,170 @@ use crate::{
     math::{add, mask, sub},
     Address, BlockHeader, Error, PoolState, Result, RpcLog, U256,
 };
-use alloy_sol_types::SolEvent;
+use alloy_sol_types::{sol_data, SolEvent, SolType};
 
 fn decode<E: SolEvent>(log: &RpcLog) -> Result<E> {
     E::decode_raw_log_validate(log.topics.iter().copied(), &log.data)
         .map_err(|e| Error::Abi(e.to_string()))
 }
-fn set_v3(state: &mut PoolState, v3: U256) -> Result<()> {
-    let stored = (v3 & mask(45)) | (((v3 >> 48usize) & mask(2)) << 45usize);
-    let clear = (mask(32) << 144usize) | (mask(15) << 240usize);
-    state.words.insert(
-        76,
-        (state.word(76)? & !clear)
-            | ((stored & mask(32)) << 144usize)
-            | ((stored >> 32usize) << 240usize),
-    );
+fn invalid() -> Error {
+    Error::InvalidData("invalid schema-7 publication".into())
+}
+fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<()> {
+    let tokens = state.tokens.len();
+    let categories = state.categories.len();
+    let generation = state.bits(8, 184, 32)?;
+    if e.lane == 8 {
+        let (addresses, limits, cats, cat_limits) =
+            <(
+                sol_data::Array<sol_data::Address>,
+                sol_data::Array<sol_data::Uint<256>>,
+                sol_data::Array<sol_data::Uint<8>>,
+                sol_data::Array<sol_data::Uint<256>>,
+            )>::abi_decode_params_validate(&e.payload)
+            .map_err(|e| Error::Abi(e.to_string()))?;
+        if addresses.len() != limits.len() || cats.len() != cat_limits.len() {
+            return Err(invalid());
+        }
+        for (address, limit) in addresses.into_iter().zip(limits) {
+            let i = state
+                .tokens
+                .iter()
+                .position(|t| t.token == address)
+                .ok_or_else(invalid)?;
+            state.set_bits(
+                120 + (i / 10) as u16,
+                i % 10 * 24,
+                24,
+                U256::from(crate::model::encode_cap(limit)),
+            )?;
+        }
+        for (c, limit) in cats.into_iter().zip(cat_limits) {
+            let c = usize::from(c);
+            if c >= categories {
+                return Err(invalid());
+            }
+            state.set_bits(
+                124 + (c / 10) as u16,
+                c % 10 * 24,
+                24,
+                U256::from(crate::model::encode_cap(limit)),
+            )?;
+        }
+    } else {
+        if e.payload.len() % 32 != 0 || e.payload.is_empty() {
+            return Err(invalid());
+        }
+        let words: Vec<U256> = e
+            .payload
+            .chunks_exact(32)
+            .map(U256::from_be_slice)
+            .collect();
+        let h = words[0];
+        let f = |offset: usize, width: usize| (h >> offset) & mask(width);
+        match e.lane {
+            1 => {
+                if words.len() != 1 + tokens.div_ceil(4)
+                    || f(81, 8) != U256::from(tokens)
+                    || f(89, 8) != U256::from(7)
+                    || f(97, 32) != generation
+                    || !(h >> 129usize).is_zero()
+                    || block > u32::MAX as u64
+                {
+                    return Err(invalid());
+                }
+                for (i, word) in words[1..].iter().enumerate() {
+                    state.words.insert(21 + i as u16, *word);
+                }
+                state.set_bits(2, 20, 16, f(0, 16))?;
+                state.set_bits(2, 36, 32, U256::from(block))?;
+                state.set_bits(2, 68, 64, f(17, 64))?;
+                state.set_bits(2, 133, 1, f(16, 1))?;
+            }
+            2 => {
+                if f(0, 8) != U256::from(7)
+                    || f(8, 8) != U256::from(tokens)
+                    || f(16, 8) != U256::from(categories)
+                    || !f(80, 32).is_zero()
+                    || f(112, 32) != state.bits(7, 160, 32)?
+                    || f(144, 32) != generation
+                    || !(h >> 176usize).is_zero()
+                {
+                    return Err(invalid());
+                }
+                let cat_words = categories.div_ceil(3);
+                let covariance_words = (categories * (categories + 1) / 2).div_ceil(16);
+                let policy_words = tokens.div_ceil(5);
+                let pair_words = (tokens * (tokens - 1) / 2).div_ceil(16);
+                if words.len() != 1 + cat_words + covariance_words + policy_words + pair_words {
+                    return Err(invalid());
+                }
+                let mut cursor = 1;
+                for i in 0..cat_words {
+                    state.set_bits(
+                        29 + i as u16,
+                        0,
+                        if i == 10 { 170 } else { 255 },
+                        words[cursor],
+                    )?;
+                    cursor += 1;
+                }
+                for i in 0..covariance_words {
+                    state.words.insert(40 + i as u16, words[cursor]);
+                    cursor += 1;
+                }
+                for i in 0..tokens {
+                    let policy = words[cursor + i / 5] >> (i % 5 * 48);
+                    state.set_bits(9 + (i / 3) as u16, i % 3 * 75 + 15, 16, policy)?;
+                    state.set_bits(9 + (i / 3) as u16, i % 3 * 75 + 43, 32, policy >> 16usize)?;
+                }
+                cursor += policy_words;
+                for i in 0..pair_words {
+                    state.words.insert(73 + i as u16, words[cursor]);
+                    cursor += 1;
+                }
+                state.set_bits(2, 134, 1, U256::ONE)?;
+                state.set_bits(2, 138, 8, f(56, 8))?;
+                state.set_bits(2, 146, 16, f(64, 16))?;
+                state.set_bits(2, 162, 32, f(24, 32))?;
+                state.refresh_categories()?;
+            }
+            4 => {
+                let wrapper_words = tokens.div_ceil(3);
+                if words.len() != 1 + wrapper_words + categories.div_ceil(4)
+                    || f(0, 8) != U256::from(7)
+                    || f(8, 8) != U256::from(tokens)
+                    || f(16, 8) != U256::from(categories)
+                    || !f(24, 8).is_zero()
+                    || f(32, 32) != generation
+                    || !(h >> 64usize).is_zero()
+                {
+                    return Err(invalid());
+                }
+                let mut coefficients = [U256::ZERO; 8];
+                for i in 0..tokens {
+                    let policy = (words[1 + i / 3] >> (i % 3 * 76)) & mask(76);
+                    coefficients[i / 4] |= (policy & mask(64)) << (i % 4 * 64);
+                    state.set_bits(9 + (i / 3) as u16, i % 3 * 75 + 31, 12, policy >> 64usize)?;
+                }
+                for (i, coefficient) in coefficients.iter().enumerate().take(tokens.div_ceil(4)) {
+                    state.words.insert(104 + i as u16, *coefficient);
+                }
+                for i in 0..categories.div_ceil(4) {
+                    state
+                        .words
+                        .insert(112 + i as u16, words[1 + wrapper_words + i]);
+                }
+                state.set_bits(2, 135, 1, U256::ONE)?;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    if state.word(2)? != e.control {
+        return Err(Error::InvalidData(
+            "publication control disagrees with replay".into(),
+        ));
+    }
     Ok(())
 }
 /// Returns a new image only after every log was checked. Never double-count swap events
@@ -56,92 +205,49 @@ pub fn apply_owned_block<'a>(
             if *topic == abi::Upgraded::SIGNATURE_HASH {
                 return Err(Error::ContractUpgraded);
             }
-            if *topic == abi::MakerStorageUpdated::SIGNATURE_HASH {
-                let e = decode::<abi::MakerStorageUpdated>(log)?;
-                if e.slot != 83
-                    && !(264..320).contains(&e.slot)
-                    && !(325..384).contains(&e.slot)
-                    && !(384..510).contains(&e.slot)
-                    && !(512..592).contains(&e.slot)
+            if *topic == abi::MakerTokenAdded::SIGNATURE_HASH
+                || *topic == abi::MakerTokenRetired::SIGNATURE_HASH
+            {
+                // Registry mutations also rewrite policy/matrix rows not included
+                // in these events. A complete new snapshot is required.
+                return Err(Error::RegistryChanged);
+            } else if *topic == abi::MakerPageUpdated::SIGNATURE_HASH {
+                page(
+                    &mut next,
+                    decode::<abi::MakerPageUpdated>(log)?,
+                    block.number,
+                )?;
+            } else if *topic == abi::MakerLendingExposureUpdated::SIGNATURE_HASH {
+                let e = decode::<abi::MakerLendingExposureUpdated>(log)?;
+                let c = usize::from(e.category);
+                if c >= next.categories.len()
+                    || U256::from(e.sequence) != next.bits(7, 160, 32)? + U256::ONE
                 {
-                    return Err(Error::InvalidData(
-                        "unexpected registry storage slot".into(),
-                    ));
+                    return Err(invalid());
                 }
-                next.words.insert(e.slot, e.value);
-            } else if *topic == abi::MakerTokenAdded::SIGNATURE_HASH {
-                let e = decode::<abi::MakerTokenAdded>(log)?;
-                if usize::from(e.tokenIndex) != next.tokens.len() || e.token != e.metadata.token {
-                    return Err(Error::InvalidData("non-append listing".into()));
-                }
-                let category = usize::from(e.metadata.category);
-                if category == next.categories.len() {
-                    next.categories.push(e.categoryMetadata);
-                } else if next.categories.get(category) != Some(&e.categoryMetadata) {
-                    return Err(Error::InvalidData(
-                        "listing changed category metadata".into(),
-                    ));
-                }
-                next.tokens.push(e.metadata);
-                // Transfers before listing are already included in this checkpoint.
-                next.balances.push(e.balance);
-            } else if *topic == abi::MakerPriceStateUpdated::SIGNATURE_HASH {
-                let e = decode::<abi::MakerPriceStateUpdated>(log)?;
-                next.words.insert(75, e.v1);
-                if !e.auxiliary.is_zero() {
-                    next.words.insert(
-                        76,
-                        (next.word(76)? & !mask(144)) | (e.auxiliary & mask(144)),
-                    );
-                    set_v3(&mut next, e.auxiliary >> 144usize)?;
-                }
-            } else if *topic == abi::MakerRiskStateUpdatedV4::SIGNATURE_HASH {
-                let e = decode::<abi::MakerRiskStateUpdatedV4>(log)?;
-                next.words.insert(75, e.v1);
-                next.words.insert(77, e.r1);
-                next.words.insert(79, e.i1);
-                next.words.insert(81, e.p1);
-                next.words.insert(82, e.p2);
-                next.words.insert(
-                    76,
-                    (next.word(76)? & !(mask(64) << 176usize)) | ((e.r2 >> 32usize) << 176usize),
-                );
-                set_v3(&mut next, e.v3)?;
-                let retained = next.word(80)? & !mask(152);
-                next.words.insert(
-                    80,
-                    e.r3 | ((e.r2 & mask(32)) << 64usize)
-                        | (e.i2 << 96usize)
-                        | retained
-                        | if e.fields & 6 == 6 {
-                            U256::ONE << 255usize
-                        } else {
-                            U256::ZERO
-                        },
-                );
-            } else if *topic == abi::MakerInventoryUpdated::SIGNATURE_HASH {
-                next.words
-                    .insert(79, decode::<abi::MakerInventoryUpdated>(log)?.i1);
-            } else if *topic == abi::MakerInventoryUpdatedV3::SIGNATURE_HASH {
-                let e = decode::<abi::MakerInventoryUpdatedV3>(log)?;
-                next.words.insert(79, e.i1);
-                next.words.insert(
-                    80,
-                    (next.word(80)? & !(mask(56) << 96usize)) | (e.i2 << 96usize),
-                );
+                next.set_bits(
+                    29 + (c / 3) as u16,
+                    c % 3 * 85,
+                    64,
+                    U256::from(e.offset as u64),
+                )?;
+                next.set_bits(7, 160, 32, U256::from(e.sequence))?;
             } else if *topic == abi::MakerWmonBalanceCheckpoint::SIGNATURE_HASH {
-                next.balances[3] = decode::<abi::MakerWmonBalanceCheckpoint>(log)?.balance;
+                let i = next
+                    .tokens
+                    .iter()
+                    .position(|t| t.token == crate::state::WMON)
+                    .ok_or_else(invalid)?;
+                next.balances[i] = decode::<abi::MakerWmonBalanceCheckpoint>(log)?.balance;
+            } else if *topic == abi::NativeBalanceCheckpoint::SIGNATURE_HASH {
+                next.native_balance = decode::<abi::NativeBalanceCheckpoint>(log)?.balance;
             } else if *topic == abi::Paused::SIGNATURE_HASH {
-                let enabled = U256::ONE << 255usize;
-                let old = next.word(75)?;
-                next.words.insert(
-                    75,
-                    if decode::<abi::Paused>(log)?.paused {
-                        old & !enabled
-                    } else {
-                        old | enabled
-                    },
-                );
+                next.set_bits(
+                    2,
+                    132,
+                    1,
+                    U256::from(decode::<abi::Paused>(log)?.paused as u8),
+                )?;
             }
         } else if let Some(index) = next.tokens.iter().position(|t| t.token == log.address) {
             if *topic == abi::Transfer::SIGNATURE_HASH {
@@ -156,12 +262,13 @@ pub fn apply_owned_block<'a>(
                 if e.to == next.proxy {
                     next.balances[index] = add(next.balances[index], e.value)?;
                 }
-            } else if index == 3 && *topic == abi::Deposit::SIGNATURE_HASH {
+            } else if log.address == crate::state::WMON && *topic == abi::Deposit::SIGNATURE_HASH {
                 let e = decode::<abi::Deposit>(log)?;
                 if e.dst == next.proxy {
                     next.balances[index] = add(next.balances[index], e.wad)?;
                 }
-            } else if index == 3 && *topic == abi::Withdrawal::SIGNATURE_HASH {
+            } else if log.address == crate::state::WMON && *topic == abi::Withdrawal::SIGNATURE_HASH
+            {
                 let e = decode::<abi::Withdrawal>(log)?;
                 if e.src == next.proxy {
                     next.balances[index] = sub(next.balances[index], e.wad)?;

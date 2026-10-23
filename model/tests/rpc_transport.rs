@@ -14,7 +14,7 @@ use tokio::{
 #[tokio::test]
 async fn each_snapshot_is_one_wire_request_for_the_complete_registry() {
     let f = support::fixture();
-    let p = support::page(&f.samples[3].snapshot);
+    let p = support::page(&f.samples[0].snapshot);
     let hash = support::hash(p.blockNumber.to::<u64>(), 0);
     let number = p.blockNumber.to::<u64>();
     let proxy = f.proxy;
@@ -42,7 +42,7 @@ async fn each_snapshot_is_one_wire_request_for_the_complete_registry() {
                 json!(thogamm_model::Bytes::from(
                     abi::getPoolDataCall {
                         startTokenIndex: 0,
-                        stopTokenIndex: 64
+                        stopTokenIndex: 32
                     }
                     .abi_encode()
                 ))
@@ -56,14 +56,14 @@ async fn each_snapshot_is_one_wire_request_for_the_complete_registry() {
         let latest = snapshot(&rpc, f.proxy, CallBlock::Latest).await.unwrap();
         assert_eq!(
             latest.state(),
-            support::polled_model(f.proxy, &f.samples[3].snapshot).state()
+            support::polled_model(f.proxy, &f.samples[0].snapshot).state()
         );
         let pinned = snapshot(&rpc, f.proxy, CallBlock::Hash(hash))
             .await
             .unwrap();
         assert_eq!(
             pinned.state(),
-            support::model(f.proxy, f.baseFee, &f.samples[3].snapshot).state()
+            support::model(f.proxy, f.baseFee, &f.samples[0].snapshot).state()
         );
         let numbered = snapshot(&rpc, f.proxy, CallBlock::Number(number))
             .await

@@ -3,19 +3,19 @@
 A Rust SDK for aggregators integrating ThogAMM on Monad. Read pool state with
 **one `eth_call`**, then calculate quotes for any number of trade sizes locally.
 
-It works with the current ThogAMM deployment and automatically supports all
-current and future tokens listed on ThogAMM. Token addresses, decimals, balances
-and pricing data are included in every update.
+Each complete refresh discovers the current schema-7 registry, including
+listings and index changes. Token addresses, decimals, balances and pricing
+data are included in the same atomic update.
 
 - **Network:** Monad mainnet, chain ID `143`
 - **ThogAMM pool:** `0x80c74517BCC2D67fFE02D3ED886796272F647210`
-- **State endpoint:** `getPoolData(0, 64)` on that pool
+- **State endpoint:** `getPoolData(0, 32)` on that pool
 
 ## Install
 
 ```toml
 [dependencies]
-state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.2.0" }
+state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.3.0" }
 ```
 
 Requires Rust 1.88 or later and an async runtime such as Tokio for state reads.
@@ -66,11 +66,17 @@ listed token addresses and decimals.
 Amounts are `U256` values in raw token units: one token with six decimals is
 `1_000_000`. `gas_price` is the intended transaction's effective price in wei;
 for EIP-1559, use `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`.
-The model includes additional spread if that price exceeds twice the block base fee.
+Execution applies one 10 bp output reduction if that price exceeds twice the
+quote block base fee or the AuctionHandler is already warm. The convenience
+methods below assume a cold AuctionHandler. Use
+`quote_execution_exact_input_with_context(..., gas_price, auction_handler_warm)`
+and `quote_exact_output_with_context(...)` to specify account warmth explicitly.
+`quote_exact_input(...)` matches `makerQuoteExactInput` with its strict 90%
+receiving-inventory caps and no execution widening. Execution checks full caps.
 
 | Method on `PoolModel` | Result |
 | --- | --- |
-| `quote_execution_exact_input(token_in, token_out, amount_in, gas_price)` | Output amount, including balance and exposure checks |
+| `quote_execution_exact_input(token_in, token_out, amount_in, gas_price)` | Output amount, including final full-cap checks; cold AuctionHandler |
 | `quote_exact_output(token_in, token_out, amount_out, gas_price)` | Required input for an exact output amount |
 | `limits(token_in, token_out)` | Directional input and output bounds |
 | `marginal_price(token_in, token_out, amount_in)` | A fraction expressing raw output units per raw input unit |
@@ -143,3 +149,24 @@ the response's block. Run `cargo run --locked --example offline`.
 
 The [event SDK](https://github.com/thogard785/thog-amm-event-sdk) uses the same
 quote model and updates it through subscriptions. Both SDKs are [MIT licensed](LICENSE).
+
+## Schema 7 and verification
+
+Version **0.3.0** supports schema 7 / wire 7 / model 1 and up to 32 active
+tokens. It replaces the incompatible schema-6 model. State includes all 126
+words, all registered ERC-20 balances, native MON, lending exposure offsets,
+separate bid/ask widths, volume charges, wrapper policies and inventory caps.
+
+Volume cost is `ceil(rate * notionalUSDWad² / 1e27)` and remains payable for
+risk-reducing trades, same-category trades and zero lambda. Sliding output
+refunds participate in the nonlinear output solve with exact integer rounding.
+
+The [integration guide](https://github.com/thogard785/thog-amm-integration-guide)
+contains the full ABI, state layout, math, settlement rules and reproducible
+fixtures. Tests cover **9,240 contract comparisons**: 2,016 mainnet read-only
+queries, 1,680 execution/exact-output calls on a local Monad fork, and 5,544
+fork boundary cases. All 5,362 successful results match exactly; all 3,878
+rejected cases also reject locally. Event replay matches 200 consecutive
+mainnet snapshots, including every word, ERC-20 balance and native balance.
+Run `cargo test --locked` (or `cargo test --workspace --locked` in the polling
+repository). Fork tests do not broadcast transactions.

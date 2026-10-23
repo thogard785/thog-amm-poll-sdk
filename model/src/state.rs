@@ -79,16 +79,23 @@ pub struct RpcLog {
     pub removed: bool,
 }
 
-/// Complete raw image. Construct through `from_pages`; pages must all describe one block.
+/// Atomic schema-7 page plus all registered ERC-20 balances and native MON.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolState {
     pub proxy: Address,
     pub block: BlockContext,
     pub tokens: Vec<TokenMetadata>,
     pub balances: Vec<U256>,
+    pub native_balance: U256,
     pub categories: Vec<CategoryMetadata>,
     pub words: BTreeMap<u16, U256>,
 }
+
+pub const WMON: Address = alloy_primitives::address!("3bd359c1119da7da1d913d1c4d2b7c461115433a");
+pub fn reference(slot: u16, offset: usize, width: usize) -> u32 {
+    (u32::from(slot) << 16) | ((offset as u32) << 8) | width as u32
+}
+
 impl PoolState {
     pub fn from_snapshot(proxy: Address, page: PoolData, hash: Option<B256>) -> Result<Self> {
         let block = BlockContext {
@@ -99,6 +106,7 @@ impl PoolState {
         };
         Self::from_pages(proxy, block, vec![page])
     }
+
     pub fn from_pages(
         proxy: Address,
         block: impl Into<BlockContext>,
@@ -108,232 +116,270 @@ impl PoolState {
         let first = pages
             .first()
             .ok_or_else(|| Error::InvalidData("no pages".into()))?;
-        let count = first.tokenCount as usize;
-        let categories = first.categories.clone();
-        if !(8..=64).contains(&count)
-            || !(5..=64).contains(&categories.len())
-            || categories.len() > count
-        {
-            return Err(Error::InvalidData("invalid token/category count".into()));
+        let count = usize::from(first.tokenCount);
+        if !(1..=32).contains(&count) || !(1..=32).contains(&first.categories.len()) {
+            return Err(Error::InvalidData("invalid registry dimensions".into()));
         }
+        let categories = first.categories.clone();
+        let balances = first.portfolioBalances.clone();
+        let native_balance = first.nativeBalance;
         let mut tokens = vec![None; count];
-        let mut balances = vec![U256::ZERO; count];
         let mut words = BTreeMap::new();
         for page in pages {
-            if page.schemaVersion != 6 {
+            if page.schemaVersion != 7 {
                 return Err(Error::UnsupportedSchema(page.schemaVersion));
             }
             if page.blockNumber != U256::from(block.number)
                 || page.baseFeePerGas != block.base_fee_per_gas
                 || page.parentBlockHash != block.parent_hash
-                || page.tokenCount as usize != count
-                || page.categoryCount as usize != categories.len()
+                || usize::from(page.tokenCount) != count
+                || usize::from(page.categoryCount) != categories.len()
                 || page.categories != categories
+                || page.portfolioBalances != balances
+                || page.nativeBalance != native_balance
                 || page.tokens.len() != page.balances.len()
-                || page.startTokenIndex as usize + page.tokens.len() > count
+                || balances.len() != count
+                || usize::from(page.startTokenIndex) + page.tokens.len() > count
+                || page.words.len() != 126
             {
-                return Err(Error::InvalidData("inconsistent pages".into()));
+                return Err(Error::InvalidData(
+                    "inconsistent or incomplete snapshot pages".into(),
+                ));
             }
             for (offset, (token, balance)) in page.tokens.into_iter().zip(page.balances).enumerate()
             {
-                let index = page.startTokenIndex as usize + offset;
-                if tokens[index].replace(token).is_some() {
-                    return Err(Error::InvalidData("overlapping token pages".into()));
+                let index = usize::from(page.startTokenIndex) + offset;
+                if balance != balances[index] || tokens[index].replace(token).is_some() {
+                    return Err(Error::InvalidData(
+                        "overlapping page or inconsistent balance".into(),
+                    ));
                 }
-                balances[index] = balance;
             }
-            let mut previous = None;
-            for word in page.words {
-                if previous.is_some_and(|slot| slot >= word.slot) {
-                    return Err(Error::InvalidData("unsorted or duplicate words".into()));
+            for (offset, word) in page.words.into_iter().enumerate() {
+                if usize::from(word.slot) != offset + 2 {
+                    return Err(Error::InvalidData(
+                        "expected unique sorted slots 2..127".into(),
+                    ));
                 }
-                previous = Some(word.slot);
-                if let Some(old) = words.insert(word.slot, word.value) {
-                    if old != word.value {
-                        return Err(Error::InvalidData(
-                            "shared word differs between pages".into(),
-                        ));
-                    }
+                if words
+                    .insert(word.slot, word.value)
+                    .is_some_and(|old| old != word.value)
+                {
+                    return Err(Error::InvalidData("pages contain different words".into()));
                 }
             }
         }
         let tokens = tokens
             .into_iter()
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| Error::InvalidData("missing token page".into()))?;
+            .ok_or_else(|| Error::InvalidData("missing token metadata".into()))?;
         let state = Self {
             proxy,
             block,
             tokens,
             balances,
+            native_balance,
             categories,
             words,
         };
         state.validate()?;
         Ok(state)
     }
+
     pub fn word(&self, slot: u16) -> Result<U256> {
         self.words
             .get(&slot)
             .copied()
             .ok_or(Error::MissingWord(slot))
     }
-    pub fn field(&self, reference: u32) -> Result<U256> {
-        if reference == 0 {
+    pub fn field(&self, r: u32) -> Result<U256> {
+        if r == 0 {
             return Ok(U256::ZERO);
         }
-        let offset = ((reference >> 8usize) & 255) as usize;
-        let width = (reference & 255) as usize;
+        let (offset, width) = (((r >> 8) & 255) as usize, (r & 255) as usize);
         if width == 0 || offset + width > 256 {
             return Err(Error::InvalidData("invalid field reference".into()));
         }
-        Ok((self.word((reference >> 16usize) as u16)? >> offset) & mask(width))
+        Ok((self.word((r >> 16) as u16)? >> offset) & mask(width))
     }
-    pub fn packed_price(&self, price: u32, tail: u32) -> Result<U256> {
-        Ok(self.field(price)? | (self.field(tail)? << ((price & 255) as usize)))
+    pub fn bits(&self, slot: u16, offset: usize, width: usize) -> Result<U256> {
+        self.field(reference(slot, offset, width))
+    }
+    pub fn packed(&self, slot: u16, index: usize, width: usize, per_word: usize) -> Result<U256> {
+        self.bits(
+            slot + (index / per_word) as u16,
+            index % per_word * width,
+            width,
+        )
+    }
+    pub fn token_bits(&self, index: usize, offset: usize, width: usize) -> Result<U256> {
+        self.bits(9 + (index / 3) as u16, index % 3 * 75 + offset, width)
+    }
+    pub fn set_bits(&mut self, slot: u16, offset: usize, width: usize, value: U256) -> Result<()> {
+        let old = self.word(slot)?;
+        self.words.insert(
+            slot,
+            (old & !(mask(width) << offset)) | ((value & mask(width)) << offset),
+        );
+        Ok(())
+    }
+    pub fn price(&self, index: usize, upper: bool) -> Result<U256> {
+        let packed = self.packed(21, index, 64, 4)?;
+        let mantissa = packed & mask(56);
+        let exponent = (packed >> 56usize).to::<u8>();
+        // The deployed decoder returns zero for invalid fields. Context rejects
+        // endpoint zero prices; inactive category prices can still value to zero.
+        if mantissa < U256::from(2_000_000) || exponent > 18 {
+            return Ok(U256::ZERO);
+        }
+        crate::math::mul(
+            mantissa + U256::from(upper as u8),
+            crate::math::pow10(18 - exponent),
+        )
+    }
+    pub fn covariance(&self, a: usize, b: usize) -> Result<i64> {
+        let (slot, offset) = covariance_location(a, b);
+        Ok(self.bits(slot, offset, 16)?.to::<u16>() as i16 as i64)
+    }
+    pub fn refresh_categories(&mut self) -> Result<()> {
+        for c in 0..self.categories.len() {
+            let anchor = self
+                .bits(29 + (c / 3) as u16, c % 3 * 85 + 80, 5)?
+                .to::<u8>();
+            let token = self
+                .tokens
+                .get(usize::from(anchor))
+                .ok_or_else(|| Error::InvalidData("unknown anchor".into()))?;
+            self.categories[c].anchorTokenIndex = anchor;
+            self.categories[c].price = token.price;
+            self.categories[c].priceTail = 0;
+        }
+        Ok(())
     }
     pub fn validate(&self) -> Result<()> {
-        if self.tokens.len() != self.balances.len()
-            || !(8..=64).contains(&self.tokens.len())
-            || !(5..=64).contains(&self.categories.len())
+        let count = self.tokens.len();
+        let categories = self.categories.len();
+        if !(1..=32).contains(&count)
+            || !(1..=32).contains(&categories)
+            || categories > count
+            || self.balances.len() != count
+            || self.words.len() != 126
         {
             return Err(Error::InvalidData("invalid image dimensions".into()));
         }
-        for slot in [75, 76, 77, 79, 80, 81, 82, 83] {
+        for slot in 2..128 {
             self.word(slot)?;
         }
-        let counts = self.word(83)?;
-        let (token_count, category_count) = if counts.is_zero() {
-            (8, 5)
-        } else {
-            (
-                (counts & U256::from(255)).to::<usize>(),
-                ((counts >> 8usize) & U256::from(255)).to::<usize>(),
-            )
-        };
-        if token_count != self.tokens.len() || category_count != self.categories.len() {
+        if self.bits(2, 0, 8)? != U256::from(7)
+            || self.bits(2, 8, 6)? != U256::from(count)
+            || self.bits(2, 14, 6)? != U256::from(categories)
+            || self.bits(8, 160, 24)? != U256::from(7 | 7 << 8 | 1 << 16)
+            || self.bits(8, 184, 32)?.is_zero()
+        {
             return Err(Error::InvalidData(
-                "counts word disagrees with metadata".into(),
+                "unsupported layout, wire, model or registry generation".into(),
             ));
         }
         let mut addresses = BTreeSet::new();
-        for (index, t) in self.tokens.iter().enumerate() {
+        for (i, t) in self.tokens.iter().enumerate() {
+            let c = usize::from(t.category);
+            let token_slot = 9 + (i / 3) as u16;
+            let token_offset = i % 3 * 75;
+            let catalog_id = self.token_bits(i, 0, 5)?.to::<usize>();
+            if self.packed(20, catalog_id, 6, 32)? != U256::from(i + 1) {
+                return Err(Error::InvalidData(
+                    "registry index disagrees with token metadata".into(),
+                ));
+            }
+            let category_slot = 29 + (c / 3) as u16;
+            let category_offset = c % 3 * 85;
             if t.token.is_zero()
                 || !addresses.insert(t.token)
                 || t.decimals > 18
-                || t.category as usize >= self.categories.len()
+                || c >= categories
+                || self.token_bits(i, 5, 5)? != U256::from(t.decimals)
+                || self.token_bits(i, 10, 5)? != U256::from(t.category)
+                || t.priceTail != 0
             {
                 return Err(Error::InvalidData("invalid token metadata".into()));
             }
-            for (reference, width) in [
-                (t.price, if index == 7 { 32 } else { 48 }),
-                (t.tokenSpread, 10),
-                (t.categorySpread, 10),
-                (t.inventory, 56),
-                (t.sides, 2),
-                (t.postedBlock, 32),
-                (t.sequence, 16),
+            for (actual, expected) in [
+                (t.price, reference(21 + (i / 4) as u16, i % 4 * 64, 64)),
+                (
+                    t.tokenBidSpread,
+                    reference(token_slot, token_offset + 15, 16),
+                ),
+                (
+                    t.tokenAskSpread,
+                    reference(token_slot, token_offset + 43, 16),
+                ),
+                (t.volumeRate, reference(token_slot, token_offset + 59, 16)),
+                (
+                    t.categorySpread,
+                    reference(category_slot, category_offset + 64, 16),
+                ),
+                (t.inventory, reference(category_slot, category_offset, 64)),
+                (t.sides, reference(2, 68 + i * 2, 2)),
+                (t.postedBlock, reference(2, 36, 32)),
+                (t.sequence, reference(2, 20, 16)),
+                (
+                    t.inventoryCap,
+                    reference(120 + (i / 10) as u16, i % 10 * 24, 24),
+                ),
+                (
+                    t.pairStart,
+                    if i == 0 {
+                        0
+                    } else {
+                        let (s, o) = pair_location(0, i);
+                        reference(s, o, 16)
+                    },
+                ),
             ] {
-                if reference == 0 || reference & 255 != width {
-                    return Err(Error::InvalidData("invalid metadata field width".into()));
+                if actual != expected {
+                    return Err(Error::InvalidData(
+                        "metadata reference disagrees with schema 7".into(),
+                    ));
                 }
             }
-            if (index == 7 && t.priceTail & 255 != 13) || (index != 7 && t.priceTail != 0) {
-                return Err(Error::InvalidData("invalid split price reference".into()));
-            }
-            for reference in [
-                t.price,
-                t.priceTail,
-                t.tokenSpread,
-                t.categorySpread,
-                t.inventory,
-                t.sides,
-                t.postedBlock,
-                t.sequence,
-                t.pairStart,
-            ] {
-                self.field(reference)?;
-            }
-            let c = &self.categories[t.category as usize];
-            if t.inventory != c.inventory || t.categorySpread != c.spread {
-                return Err(Error::InvalidData("category references disagree".into()));
-            }
         }
-        for (index, c) in self.categories.iter().enumerate() {
+        for (c, m) in self.categories.iter().enumerate() {
             let anchor = self
+                .bits(29 + (c / 3) as u16, c % 3 * 85 + 80, 5)?
+                .to::<usize>();
+            let t = self
                 .tokens
-                .get(c.anchorTokenIndex as usize)
+                .get(anchor)
                 .ok_or_else(|| Error::InvalidData("unknown category anchor".into()))?;
-            if anchor.category as usize != index
-                || c.price != anchor.price
-                || c.priceTail != anchor.priceTail
-                || c.postedBlock != anchor.postedBlock
+            if usize::from(m.anchorTokenIndex) != anchor
+                || usize::from(t.category) != c
+                || m.price != t.price
+                || m.priceTail != 0
+                || m.inventory != t.inventory
+                || m.spread != t.categorySpread
+                || m.postedBlock != t.postedBlock
+                || m.inventoryCap != reference(124 + (c / 10) as u16, c % 10 * 24, 24)
             {
                 return Err(Error::InvalidData(
-                    "category anchor disagrees with registry".into(),
+                    "category metadata disagrees with words".into(),
                 ));
-            }
-            for reference in [c.price, c.priceTail, c.inventory, c.spread, c.postedBlock] {
-                self.field(reference)?;
-            }
-        }
-        // Legacy pair/covariance words were checked above. Extension fields are
-        // contiguous: 25 pair spreads or 16 covariance entries per packed word.
-        // Validate each word once instead of repeating a tree lookup per field.
-        let tokens = self.tokens.len();
-        let pair_fields = tokens * (tokens - 1) / 2 - 28;
-        for word in 0..pair_fields.div_ceil(25) {
-            self.word(512 + word as u16)?;
-        }
-        let categories = self.categories.len();
-        if categories > 5 {
-            let covariance_fields = categories * (categories - 1) / 2;
-            for word in 0..covariance_fields.div_ceil(16) {
-                self.word(384 + word as u16)?;
             }
         }
         Ok(())
     }
 }
 
-pub fn pair_location(mut left: usize, mut right: usize) -> (u16, usize) {
-    if left > right {
-        std::mem::swap(&mut left, &mut right);
+pub fn pair_location(mut a: usize, mut b: usize) -> (u16, usize) {
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
     }
-    let field = if right < 8 {
-        left * (15 - left) / 2 + right - left - 1
-    } else {
-        right * (right - 1) / 2 + left - 28
-    };
-    (
-        (if right < 8 { 81 } else { 512 }) + (field / 25) as u16,
-        field % 25 * 10,
-    )
+    let field = b * (b - 1) / 2 + a;
+    (73 + (field / 16) as u16, field % 16 * 16)
 }
-pub fn covariance_location(mut left: usize, mut right: usize) -> (u16, usize) {
-    if left > right {
-        std::mem::swap(&mut left, &mut right);
+pub fn covariance_location(mut a: usize, mut b: usize) -> (u16, usize) {
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
     }
-    if left == 0 {
-        return (0, 0);
-    }
-    if right < 4 {
-        let field = if left == 1 {
-            right - 1
-        } else if left == 2 {
-            right + 1
-        } else {
-            5
-        };
-        if field < 2 {
-            (80, 64 + field * 16)
-        } else {
-            (76, 176 + (field - 2) * 16)
-        }
-    } else if right == 4 {
-        (80, (left - 1) * 16)
-    } else {
-        let field = (right - 1) * right / 2 + left - 1;
-        (384 + (field / 16) as u16, field % 16 * 16)
-    }
+    let field = b * (b + 1) / 2 + a;
+    (40 + (field / 16) as u16, field % 16 * 16)
 }

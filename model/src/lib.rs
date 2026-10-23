@@ -1,6 +1,7 @@
 //! Calculate ThogAMM quotes locally from pool state using exact integer arithmetic.
 //! Quotes describe the snapshot's block and perform no network calls.
 pub mod abi;
+mod curve;
 pub mod events;
 pub mod math;
 pub mod model;
@@ -41,5 +42,7 @@ pub enum Error {
         "ThogAMM was upgraded; obtain the supported SDK release from ThogAMM before reconnecting"
     )]
     ContractUpgraded,
+    #[error("ThogAMM registry changed; reconnect to load the complete replacement state")]
+    RegistryChanged,
 }
 pub type Result<T> = std::result::Result<T, Error>;

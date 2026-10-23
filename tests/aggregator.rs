@@ -8,7 +8,7 @@ use thogamm_model::{abi, Error};
 #[test]
 fn externally_fetched_state_supports_all_quote_surfaces_without_a_reader() {
     let f = support::fixture();
-    let set = &f.samples[3];
+    let set = &f.samples[0];
     let number = support::page(&set.snapshot).blockNumber.to::<u64>();
     // There is no RPC client or SDK background task in this path.
     let model = decode_pool_data(f.proxy, &set.snapshot, CallBlock::Number(number)).unwrap();
@@ -73,7 +73,7 @@ fn externally_fetched_state_supports_all_quote_surfaces_without_a_reader() {
 #[test]
 fn external_state_rejects_bad_abi_incomplete_registry_schema_and_wrong_block() {
     let f = support::fixture();
-    let bytes = &f.samples[3].snapshot;
+    let bytes = &f.samples[0].snapshot;
     let mut page = support::page(bytes);
     let number = page.blockNumber.to::<u64>();
     assert!(decode_pool_data(f.proxy, &bytes[..bytes.len() - 1], CallBlock::Latest).is_err());
@@ -87,7 +87,7 @@ fn external_state_rejects_bad_abi_incomplete_registry_schema_and_wrong_block() {
         ),
         Err(Error::UnsupportedSchema(5))
     ));
-    page.schemaVersion = 6;
+    page.schemaVersion = 7;
     page.tokens.pop();
     page.balances.pop();
     assert!(decode_pool_data(

@@ -4,19 +4,19 @@ use state_poll_sdk::{Config, StatePollSdk};
 use thogamm_model::{rpc::CallBlock, Error, U256};
 
 #[tokio::test]
-async fn one_call_loads_all_64_tokens_and_unchanged_refresh_is_also_one_call() {
+async fn one_call_loads_all_registered_tokens_and_unchanged_refresh_is_also_one_call() {
     let f = support::fixture();
     let rpc = support::MockRpc::default();
-    rpc.insert(support::page(&f.samples[3].snapshot), f.baseFee);
+    rpc.insert(support::page(&f.samples[0].snapshot), f.baseFee);
     let mut sdk = StatePollSdk::with_reader(rpc.clone(), f.proxy, Config::default())
         .await
         .unwrap();
     assert_eq!(rpc.call_count(), 1);
     assert_eq!(
         sdk.model().state(),
-        support::polled_model(f.proxy, &f.samples[3].snapshot).state()
+        support::polled_model(f.proxy, &f.samples[0].snapshot).state()
     );
-    assert_eq!(sdk.model().max_index(), 63);
+    assert_eq!(sdk.model().max_index(), 7);
     assert!(!sdk.refresh().await.unwrap());
     assert_eq!(rpc.call_count(), 2);
     assert!(sdk.model().state().block.hash.is_none());
@@ -29,7 +29,7 @@ async fn one_call_loads_all_64_tokens_and_unchanged_refresh_is_also_one_call() {
         .all(|(block, _)| *block == CallBlock::Latest));
 }
 #[tokio::test]
-async fn one_call_discovers_new_listings_without_max_index_or_pagination() {
+async fn one_call_refreshes_complete_state_without_auxiliary_reads() {
     let f = support::fixture();
     let rpc = support::MockRpc::from_events(&f);
     let mut sdk = StatePollSdk::with_reader(rpc.clone(), f.proxy, Config::default())
@@ -39,7 +39,7 @@ async fn one_call_discovers_new_listings_without_max_index_or_pagination() {
     rpc.0.lock().unwrap().head = last.blockNumber.to::<u64>();
     assert!(sdk.refresh().await.unwrap());
     assert_eq!(rpc.call_count(), 2);
-    assert_eq!(sdk.model().max_index(), 17);
+    assert_eq!(sdk.model().max_index(), 7);
     assert_eq!(
         sdk.model().state(),
         support::polled_model(f.proxy, &f.events[10].afterState).state()
@@ -83,6 +83,7 @@ async fn same_height_replacement_and_fee_changes_are_observed_in_the_single_call
         let hash = c.headers[&number].hash;
         let p = c.states.get_mut(&hash).unwrap();
         p.balances[0] += U256::ONE;
+        p.portfolioBalances[0] += U256::ONE;
         p.baseFeePerGas *= U256::from(2);
         p.parentBlockHash = support::hash(number - 1, 1);
     }

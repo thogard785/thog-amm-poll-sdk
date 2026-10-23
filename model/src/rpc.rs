@@ -1,4 +1,4 @@
-//! One request per snapshot: eth_call(getPoolData(0, 64)).
+//! One request per snapshot: eth_call(getPoolData(0, 32)).
 use crate::{abi, Address, Bytes, Error, PoolModel, Result, B256};
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
@@ -103,7 +103,7 @@ fn state_call_params(to: Address, data: Bytes, block: CallBlock) -> Value {
 pub fn pool_data_calldata() -> Bytes {
     abi::getPoolDataCall {
         startTokenIndex: 0,
-        stopTokenIndex: 64,
+        stopTokenIndex: 32,
     }
     .abi_encode()
     .into()
@@ -114,7 +114,7 @@ pub fn pool_data_calldata() -> Bytes {
 pub fn pool_data_params(proxy: Address, block: CallBlock) -> Value {
     state_call_params(proxy, pool_data_calldata(), block)
 }
-/// Build an offline model from the raw ABI return bytes of getPoolData(0,64).
+/// Build an offline model from the raw ABI return bytes of getPoolData(0,32).
 /// `block` must be the selector used for that request. Hash provenance is supplied
 /// by the caller; the EVM cannot verify or return its own current block hash.
 /// This validates the image and performs no RPC, header lookup or subscription.
