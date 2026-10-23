@@ -229,3 +229,53 @@ fn boundary_states_match_deployed_bytecode() {
     assert!(refunds > 0);
     println!("{checked} deployed cases: {success} exact results, {} reverts, {volume} volume charges, {refunds} net wrapper refunds",checked-success);
 }
+
+#[test]
+fn mainnet_lending_pause_and_unpause_match_fresh_snapshots() {
+    use alloy_sol_types::SolEvent;
+    use thogamm_model::{events::apply_owned_block, BlockHeader, RpcLog};
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(
+        &include_bytes!("../../tests/common/events-lending-pause-v7.json.gz")[..],
+    )
+    .read_to_end(&mut bytes)
+    .unwrap();
+    let f: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut saw = [false; 3];
+    for capture in f["captures"].as_array().unwrap() {
+        let proxy: Address = capture["proxy"].as_str().unwrap().parse().unwrap();
+        let decode = |b: &serde_json::Value| {
+            let data: Bytes = b["snapshot"].as_str().unwrap().parse().unwrap();
+            let h: BlockHeader = serde_json::from_value(b["header"].clone()).unwrap();
+            PoolModel::from_snapshot(
+                proxy,
+                abi::getPoolDataCall::abi_decode_returns_validate(&data).unwrap(),
+                Some(h.hash),
+            )
+            .unwrap()
+        };
+        let blocks = capture["blocks"].as_array().unwrap();
+        let mut state = decode(&blocks[0]).into_state();
+        for b in &blocks[1..] {
+            let logs: Vec<RpcLog> = serde_json::from_value(b["logs"].clone()).unwrap();
+            for l in &logs {
+                if l.topics[0] == abi::MakerLendingExposureUpdated::SIGNATURE_HASH {
+                    saw[0] = true;
+                }
+                if l.topics[0] == abi::Paused::SIGNATURE_HASH {
+                    let e = abi::Paused::decode_raw_log_validate(l.topics.iter().copied(), &l.data)
+                        .unwrap();
+                    saw[if e.paused { 1 } else { 2 }] = true;
+                }
+            }
+            state = apply_owned_block(
+                state,
+                serde_json::from_value(b["header"].clone()).unwrap(),
+                &logs,
+            )
+            .unwrap();
+            assert_eq!(&state, decode(b).state(), "{}", capture["name"]);
+        }
+    }
+    assert_eq!(saw, [true; 3]);
+}
