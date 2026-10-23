@@ -121,6 +121,9 @@ pub fn pool_data_params(proxy: Address, block: CallBlock) -> Value {
 pub fn decode_pool_data(proxy: Address, bytes: &[u8], block: CallBlock) -> Result<PoolModel> {
     let page = abi::getPoolDataCall::abi_decode_returns_validate(bytes)
         .map_err(|e| Error::Abi(e.to_string()))?;
+    if page.baseFeePerGas.is_zero() {
+        return Err(Error::MissingBaseFee);
+    }
     if page.startTokenIndex != 0 || page.tokens.len() != usize::from(page.tokenCount) {
         return Err(Error::InvalidData(
             "RPC returned an incomplete registry".into(),

@@ -145,3 +145,18 @@ fn settlement_binding_preserves_recipient_minimum_and_block_deadline() {
         &args.deadlineBlock.to_be_bytes::<32>()
     );
 }
+
+#[test]
+fn fee_free_transport_snapshot_is_rejected_before_execution_pricing() {
+    let f = support::fixture();
+    let mut page = support::page(&f.samples[0].snapshot);
+    page.baseFeePerGas = U256::ZERO;
+    assert!(matches!(
+        decode_pool_data(
+            f.proxy,
+            &abi::getPoolDataCall::abi_encode_returns(&page),
+            CallBlock::Latest
+        ),
+        Err(Error::MissingBaseFee)
+    ));
+}

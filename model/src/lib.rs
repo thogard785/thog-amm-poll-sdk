@@ -14,6 +14,8 @@ pub use state::{BlockContext, BlockHeader, PoolState, RpcLog};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("snapshot BASEFEE is zero; fetch Monad pool state with a nonzero eth_call gasPrice")]
+    MissingBaseFee,
     #[error("invalid pool data: {0}")]
     InvalidData(String),
     #[error("missing storage word {0}")]
