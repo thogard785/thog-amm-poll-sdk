@@ -48,9 +48,7 @@ pub enum Error {
     Abi(String),
     #[error("ThogAMM subscription lost continuity; reconnect to load current pool state")]
     Discontinuous,
-    #[error(
-        "ThogAMM was upgraded; obtain the supported SDK release from ThogAMM before reconnecting"
-    )]
+    #[error("ThogAMM was upgraded; reconnect to validate a complete post-upgrade snapshot")]
     ContractUpgraded,
     #[error("ThogAMM registry changed; reconnect to load the complete replacement state")]
     RegistryChanged,
