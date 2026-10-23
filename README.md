@@ -19,9 +19,8 @@ state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag 
 ```
 
 Requires Rust 1.88 or later and an async runtime such as Tokio for state reads.
-Set your application's `rust-version` and use Cargo resolver `"3"` at the package
-or workspace root so dependencies respect that Rust version. Commit your
-application's `Cargo.lock`. Import the crate as `state_poll_sdk`.
+Both Cargo resolvers 2 and 3 are supported. Commit your application's
+`Cargo.lock`. Import the crate as `state_poll_sdk`.
 
 ## Connect once, then quote locally
 
@@ -122,7 +121,7 @@ See [examples/offline.rs](examples/offline.rs) for quoting a saved response.
 
 The SDK exposes `model::abi::makerSwapExactInputCall` with `tokenIn`, `tokenOut`,
 `amountIn`, `minAmountOut`, `recipient` and `deadlineBlock`. Encode it with
-`alloy_sol_types::SolCall` (`alloy-sol-types = "=1.7.3"`) and send it to the
+`alloy_sol_types::SolCall` (`alloy-sol-types = "1"`) and send it to the
 ThogAMM pool. The input holder approves the pool to spend the input token;
 the pool pulls it from the caller using `transferFrom`. Use wrapped MON for
 native-token trades and send zero native value.
