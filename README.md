@@ -51,8 +51,9 @@ async fn follow_quotes(
 ```
 
 `connect()` loads the initial model with one call. `refresh()` updates it with
-exactly one call. `next_update()` waits for the configured interval (500 ms by
-default) and then refreshes once. These updates include all listed tokens and
+exactly one call. `next_update()` refreshes on a 250 ms cadence by default,
+without adding the RPC duration to each interval or bursting to catch up.
+If you already follow chain heads, call `refresh()` for each new block. These updates include all listed tokens and
 require no additional header, balance or token-discovery calls.
 
 You control when to update. Quote methods are synchronous and make no network

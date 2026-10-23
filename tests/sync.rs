@@ -195,3 +195,39 @@ async fn timeout_cancellation_and_unsupported_schema_invalidate_live_state() {
     ));
     assert!(matches!(sdk.model(), Err(Error::SnapshotUnavailable)));
 }
+
+#[derive(Clone)]
+struct SlowReader(support::MockRpc);
+#[async_trait::async_trait]
+impl state_poll_sdk::ChainReader for SlowReader {
+    async fn call(
+        &self,
+        to: thogamm_model::Address,
+        data: thogamm_model::Bytes,
+        block: CallBlock,
+    ) -> thogamm_model::Result<thogamm_model::Bytes> {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        self.0.call(to, data, block).await
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn polling_cadence_does_not_accumulate_rpc_duration() {
+    use std::time::Duration;
+    let f = support::fixture();
+    let rpc = support::MockRpc::from_events(&f);
+    let mut sdk = StatePollSdk::with_reader(
+        SlowReader(rpc.clone()),
+        f.proxy,
+        Config {
+            poll_interval: Duration::from_millis(100),
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    sdk.next_update().await.unwrap();
+    let first = tokio::time::Instant::now();
+    sdk.next_update().await.unwrap();
+    assert_eq!(first.elapsed(), Duration::from_millis(100));
+    assert_eq!(rpc.call_count(), 3);
+}

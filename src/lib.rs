@@ -9,7 +9,7 @@ pub use thogamm_model::{self as model, Address, Error, PoolModel, Result, U256};
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Time between calls when using `next_update()`. `refresh()` does not wait.
+    /// Request cadence for `next_update()`. `refresh()` does not wait.
     pub poll_interval: Duration,
     /// Deadline for one state request, including custom ChainReader implementations.
     pub request_timeout: Duration,
@@ -17,7 +17,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_millis(500),
+            poll_interval: Duration::from_millis(250),
             request_timeout: Duration::from_secs(2),
         }
     }
@@ -29,6 +29,7 @@ pub struct StatePollSdk<R = HttpRpc> {
     config: Config,
     healthy: bool,
     received_at: SystemTime,
+    timer: tokio::time::Interval,
 }
 impl StatePollSdk<HttpRpc> {
     /// Connect using a Monad HTTP RPC endpoint and the ThogAMM pool address.
@@ -55,7 +56,13 @@ impl<R: ChainReader> StatePollSdk<R> {
         )
         .await
         .map_err(|_| Error::Transport("state request timed out".into()))??;
+        let mut timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + config.poll_interval,
+            config.poll_interval,
+        );
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Ok(Self {
+            timer,
             reader,
             model,
             config,
@@ -103,10 +110,10 @@ impl<R: ChainReader> StatePollSdk<R> {
         self.model = next;
         Ok(true)
     }
-    /// Wait one polling interval, then make exactly one call. Return the model
+    /// Wait for the next scheduled tick, then make exactly one call. Return the model
     /// even if unchanged; waiting for a change must not hide additional calls.
     pub async fn next_update(&mut self) -> Result<&PoolModel> {
-        tokio::time::sleep(self.config.poll_interval).await;
+        self.timer.tick().await;
         self.refresh().await?;
         Ok(&self.model)
     }
