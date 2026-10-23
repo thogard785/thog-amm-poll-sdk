@@ -15,9 +15,10 @@ data are included in the same atomic update.
 
 ```toml
 [dependencies]
-state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.3.0" }
+state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", rev = "63107574fbc3b4e369782e5b25a0315f23061f98" }
 ```
 
+This review revision builds on v0.3.0; use the pinned revision for the API shown below.
 Requires Rust 1.88 or later and an async runtime such as Tokio for state reads.
 Both Cargo resolvers 2 and 3 are supported. Commit your application's
 `Cargo.lock`. Import the crate as `state_poll_sdk`.
