@@ -24,6 +24,9 @@ pub mod quantity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockHeader {
+    /// Unix block timestamp from the subscription; zero if absent in historical fixtures.
+    #[serde(default)]
+    pub timestamp: U256,
     #[serde(with = "quantity")]
     pub number: u64,
     pub hash: B256,
@@ -53,6 +56,7 @@ impl TryFrom<BlockContext> for BlockHeader {
     type Error = Error;
     fn try_from(context: BlockContext) -> Result<Self> {
         Ok(Self {
+            timestamp: U256::ZERO,
             number: context.number,
             hash: context
                 .hash

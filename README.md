@@ -40,7 +40,7 @@ async fn follow_quotes(
 ) -> Result<()> {
     let mut sdk = StatePollSdk::connect(rpc, pool, Config::default()).await?;
     loop {
-        let model = sdk.model();
+        let model = sdk.model()?;
         match model.quote_execution_exact_input(token_in, token_out, amount_in, gas_price) {
             Ok(quote) => println!("amount_out={}", quote.amount_out),
             Err(error) => eprintln!("quote unavailable: {error}"),
@@ -56,8 +56,9 @@ default) and then refreshes once. These updates include all listed tokens and
 require no additional header, balance or token-discovery calls.
 
 You control when to update. Quote methods are synchronous and make no network
-calls. A failed refresh preserves the last valid snapshot; use
-`model.state().block.number` to track its age. `model.state().tokens` provides
+calls. A failed refresh returns its cause and makes `sdk.model()` unavailable
+until a complete refresh succeeds. Use `model.state().block.number` to identify
+the source block. `model.state().tokens` provides
 listed token addresses and decimals.
 
 ## Quote trade sizes
@@ -169,3 +170,11 @@ rejected cases also reject locally. Event replay matches 200 consecutive
 mainnet snapshots, including every word, ERC-20 balance and native balance.
 Run `cargo test --locked` (or `cargo test --workspace --locked` in the polling
 repository). Fork tests do not broadcast transactions.
+
+Live `sdk.model()` returns `Result<&PoolModel>`. A failed or cancelled refresh
+invalidates live access until a full read succeeds. `received_at()` exposes the
+last successful read time, and `Config::request_timeout` bounds each read
+(default 2 seconds). Run updates continuously and compare the snapshot block
+with your own head. A cloned model is a historical snapshot; it does not become
+current as wall time passes. Use `at_block(landing_block, base_fee)` to evaluate
+the contract's exact block-age rule for an intended landing block.
