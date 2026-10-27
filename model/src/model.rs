@@ -8,7 +8,14 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Quote {
+    /// Raw input passed to ThogAMM, not the pool's balance delta or an upstream
+    /// funding amount. Exact-output quotes return the minimum required input.
     pub amount_in: U256,
+    /// Raw output of the modeled call. For execution quotes, this is guaranteed
+    /// recipient credit under the quoted state and execution context: compare
+    /// `received >= amount_out`, not equality. Actual xStock credit may be higher.
+    /// Exact-output quotes set this to the requested target. Read-only quotes
+    /// omit execution friction; simulate settlement before treating one as a fill.
     pub amount_out: U256,
     pub notional_usd_wad: U256,
     pub penalty_usd_wad: U256,
@@ -136,6 +143,8 @@ impl PoolModel {
         self.prepare(input, output)?
             .quote_execution_exact_input_with_context(amount, gas_price, auction_handler_warm)
     }
+    /// Minimum raw input for ERC-7815 Buy; `Quote::amount_out` equals the target.
+    /// Actual xStock recipient credit may exceed that guaranteed output.
     pub fn quote_exact_output(
         &self,
         input: Address,
@@ -456,8 +465,8 @@ impl PreparedPair<'_> {
             .check_inventory(&self.curve, amount, q.amount_out, false)?;
         Ok(q)
     }
-    /// Minimum raw input for ERC-7815 Buy. The payout is exactly the target;
-    /// min-input arithmetic may otherwise produce an extra raw output unit.
+    /// Minimum raw input for ERC-7815 Buy. Guaranteed output equals the target;
+    /// actual xStock recipient credit may exceed it after share rounding.
     pub fn quote_exact_output(&self, target: U256, gas_price: U256) -> Result<Quote> {
         self.quote_exact_output_with_context(target, gas_price, false)
     }

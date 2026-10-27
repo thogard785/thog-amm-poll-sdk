@@ -11,6 +11,10 @@ pub struct ShareBalance {
 pub type ShareBalances = BTreeMap<Address, ShareBalance>;
 pub type Multipliers = BTreeMap<Address, U256>;
 
+/// Recognizes the deployed contract's nine compiled unwrapped xStock addresses.
+/// Active listings are discovered separately from pool state. Extending the
+/// contract's xStock catalog requires a matching SDK release; registry discovery
+/// alone does not recognize an arbitrary new issuer token.
 pub fn is_xstock(token: Address) -> bool {
     const TOKENS: [Address; 9] = [
         alloy_primitives::address!("90a2a4c76b5d8c0bc892a69ea28aa775a8f2dd48"), // SPYx

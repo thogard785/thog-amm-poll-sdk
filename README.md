@@ -1,7 +1,7 @@
 # ThogAMM polling SDK
 
 Read a complete ThogAMM snapshot, then quote any number of trade sizes locally.
-Version **0.4.0** supports **schema 8 / wire 8 / model 2** and the current 13-token
+Version **0.4.1** supports **schema 8 / wire 8 / model 2** and the current 13-token
 registry, including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped
 xStocks with 18 decimals. Addresses are in the [integration guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
@@ -13,7 +13,7 @@ xStocks with 18 decimals. Addresses are in the [integration guide](https://githu
 
 ```toml
 [dependencies]
-state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.4.0" }
+state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.4.1" }
 ```
 
 ```rust
@@ -40,6 +40,9 @@ Quote methods are synchronous and perform no network calls. A failed refresh
 returns an error and retains the previous snapshot. Check
 `model.state().block.number` and `.hash` for provenance; `.tokens` supplies the
 active registry. New listings and index changes are discovered on refresh.
+Share accounting recognizes the contract's [nine compiled xStock addresses](model/src/shares.rs).
+Listing another of those nine needs no model change; extending the contract's
+xStock catalog requires a matching SDK release.
 
 ## Quote methods
 
@@ -57,6 +60,13 @@ caller/recipient and no extra fee. Their defaults use a cold AuctionHandler;
 accept `auction_handler_warm` as the final argument. Pass the transaction's
 **effective** gas price, not its maximum fee cap. The model reproduces the
 contract's share floors, dust and the distinct direct/Buy friction rounding.
+
+`Quote.amount_in` is the amount passed to Thog. For execution quotes,
+`amount_out` is guaranteed recipient credit at the quoted state/context:
+compare `received >= amount_out`, not equality. For Buy it equals the target;
+actual xStock credit may be higher. Read-only quotes omit execution friction.
+If your router first pulls funds, quote/pass its measured newly received input,
+not the requested transfer or its total balance. See the [funding example](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#funding-through-an-aggregator).
 
 For an amount ladder, call `model.prepare(in, out)?` once and use the same methods
 on the returned pair, omitting token arguments. Clone models to share immutable
