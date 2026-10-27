@@ -1,8 +1,12 @@
-//! One request per snapshot: eth_call(getPoolData(0, 32)).
-use crate::{abi, Address, Bytes, Error, PoolModel, Result, B256};
+//! Hash-pinned pool and issuer state. Quotes perform no network calls.
+use crate::{
+    abi, shares::is_xstock, Address, BlockHeader, Bytes, Error, Multipliers, PoolModel, Result,
+    ShareBalance, ShareBalances, B256,
+};
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -29,13 +33,18 @@ impl CallBlock {
         }
     }
 }
-/// Deliberately exposes only eth_call. Snapshot construction needs no other RPC.
-/// Implementations must preserve the selected block's BASEFEE: on Monad, set a
-/// nonzero simulation gasPrice (the built-in reader uses 1 wei). Omitting fee
-/// fields can zero BASEFEE in eth_call, corrupting execution-friction context.
+/// Reads must preserve BASEFEE. The built-in transport sets gasPrice to 1 wei.
 #[async_trait]
 pub trait ChainReader: Clone + Send + Sync {
-    async fn call(&self, to: Address, data: Bytes, block: CallBlock) -> Result<Bytes>;
+    async fn header(&self, block: CallBlock) -> Result<BlockHeader>;
+    async fn calls(&self, calls: Vec<(Address, Bytes)>, block: CallBlock) -> Result<Vec<Bytes>>;
+    async fn call(&self, to: Address, data: Bytes, block: CallBlock) -> Result<Bytes> {
+        let mut results = self.calls(vec![(to, data)], block).await?;
+        if results.len() != 1 {
+            return Err(Error::Rpc("expected one call result".into()));
+        }
+        Ok(results.remove(0))
+    }
 }
 #[derive(Clone)]
 pub struct HttpRpc {
@@ -87,13 +96,61 @@ impl HttpRpc {
 }
 #[async_trait]
 impl ChainReader for HttpRpc {
-    async fn call(&self, to: Address, data: Bytes, block: CallBlock) -> Result<Bytes> {
-        let value = self
-            // This is a state read, not a trade simulation. Nonzero gasPrice
-            // preserves BASEFEE without fetching a header or fee suggestion.
-            .request("eth_call", state_call_params(to, data, block))
-            .await?;
-        serde_json::from_value(value).map_err(|e| Error::Rpc(e.to_string()))
+    async fn header(&self, block: CallBlock) -> Result<BlockHeader> {
+        let (method, selector) = match block {
+            CallBlock::Hash(hash) => ("eth_getBlockByHash", json!(hash)),
+            _ => ("eth_getBlockByNumber", block.rpc_value()),
+        };
+        serde_json::from_value(self.request(method, json!([selector, false])).await?)
+            .map_err(|e| Error::Rpc(e.to_string()))
+    }
+    async fn calls(&self, calls: Vec<(Address, Bytes)>, block: CallBlock) -> Result<Vec<Bytes>> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first = self
+            .next_id
+            .fetch_add(calls.len() as u64, Ordering::Relaxed);
+        let requests: Vec<_> = calls.into_iter().enumerate().map(|(i, (to, data))|
+            json!({"jsonrpc":"2.0", "id":first+i as u64, "method":"eth_call", "params":state_call_params(to,data,block)})
+        ).collect();
+        let results: Vec<Value> = self
+            .client
+            .post(&self.url)
+            .json(&requests)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(e.without_url().to_string()))?
+            .error_for_status()
+            .map_err(|e| Error::Transport(e.without_url().to_string()))?
+            .json()
+            .await
+            .map_err(|e| Error::Rpc(e.without_url().to_string()))?;
+        let mut by_id = BTreeMap::new();
+        for result in results {
+            let id = result["id"]
+                .as_u64()
+                .ok_or_else(|| Error::Rpc("missing batch ID".into()))?;
+            if result["jsonrpc"] != "2.0"
+                || id < first
+                || id >= first + requests.len() as u64
+                || by_id.insert(id, result).is_some()
+            {
+                return Err(Error::Rpc("invalid JSON-RPC batch".into()));
+            }
+        }
+        (0..requests.len())
+            .map(|i| {
+                let response = by_id
+                    .remove(&(first + i as u64))
+                    .ok_or_else(|| Error::Rpc("incomplete JSON-RPC batch".into()))?;
+                if let Some(error) = response.get("error") {
+                    return Err(Error::Rpc(error.to_string()));
+                }
+                serde_json::from_value(response["result"].clone())
+                    .map_err(|e| Error::Rpc(e.to_string()))
+            })
+            .collect()
     }
 }
 fn state_call_params(to: Address, data: Bytes, block: CallBlock) -> Value {
@@ -103,7 +160,7 @@ fn state_call_params(to: Address, data: Bytes, block: CallBlock) -> Value {
 pub fn pool_data_calldata() -> Bytes {
     abi::getPoolDataCall {
         startTokenIndex: 0,
-        stopTokenIndex: 32,
+        stopTokenIndex: 28,
     }
     .abi_encode()
     .into()
@@ -114,11 +171,14 @@ pub fn pool_data_calldata() -> Bytes {
 pub fn pool_data_params(proxy: Address, block: CallBlock) -> Value {
     state_call_params(proxy, pool_data_calldata(), block)
 }
-/// Build an offline model from the raw ABI return bytes of getPoolData(0,32).
-/// `block` must be the selector used for that request. Hash provenance is supplied
-/// by the caller; the EVM cannot verify or return its own current block hash.
-/// This validates the image and performs no RPC, header lookup or subscription.
-pub fn decode_pool_data(proxy: Address, bytes: &[u8], block: CallBlock) -> Result<PoolModel> {
+/// Decode a complete pool image and issuer share state read at the same block.
+/// The caller owns provenance for externally supplied reads.
+pub fn decode_pool_data(
+    proxy: Address,
+    bytes: &[u8],
+    block: CallBlock,
+    shares: ShareBalances,
+) -> Result<PoolModel> {
     let page = abi::getPoolDataCall::abi_decode_returns_validate(bytes)
         .map_err(|e| Error::Abi(e.to_string()))?;
     if page.startTokenIndex != 0 || page.tokens.len() != usize::from(page.tokenCount) {
@@ -137,15 +197,91 @@ pub fn decode_pool_data(proxy: Address, bytes: &[u8], block: CallBlock) -> Resul
         CallBlock::Hash(hash) => Some(hash),
         _ => None,
     };
-    PoolModel::from_snapshot(proxy, page, hash)
+    PoolModel::from_snapshot(proxy, page, hash, shares)
 }
-/// Fetch every listed token, balance, dependency and quote context in exactly
-/// one call. No maxIndex query, header query, pagination loop, retry or batch.
+/// Read current issuer multipliers at a known block, including activations without logs.
+pub async fn read_multipliers<R: ChainReader>(
+    rpc: &R,
+    tokens: &[Address],
+    hash: B256,
+) -> Result<Multipliers> {
+    let tokens: Vec<_> = tokens.iter().copied().filter(|t| is_xstock(*t)).collect();
+    let calls = tokens
+        .iter()
+        .map(|t| (*t, abi::getCurrentMultiplierCall {}.abi_encode().into()))
+        .collect();
+    let results = rpc.calls(calls, CallBlock::Hash(hash)).await?;
+    if results.len() != tokens.len() {
+        return Err(Error::Rpc("incomplete issuer batch".into()));
+    }
+    tokens
+        .into_iter()
+        .zip(results)
+        .map(|(token, data)| {
+            let m = abi::getCurrentMultiplierCall::abi_decode_returns_validate(&data)
+                .map_err(|e| Error::Abi(e.to_string()))?
+                .multiplier;
+            if m.is_zero() {
+                return Err(Error::InvalidData("zero xStock multiplier".into()));
+            }
+            Ok((token, m))
+        })
+        .collect()
+}
+/// Header, pool image, then one issuer batch, all eth_calls pinned to the header hash.
 pub async fn snapshot<R: ChainReader>(
     rpc: &R,
     proxy: Address,
     block: CallBlock,
 ) -> Result<PoolModel> {
-    let bytes = rpc.call(proxy, pool_data_calldata(), block).await?;
-    decode_pool_data(proxy, &bytes, block)
+    let header = rpc.header(block).await?;
+    if matches!(block, CallBlock::Hash(hash) if hash != header.hash)
+        || matches!(block, CallBlock::Number(number) if number != header.number)
+    {
+        return Err(Error::InvalidData(
+            "RPC header differs from requested block".into(),
+        ));
+    }
+    let pinned = CallBlock::Hash(header.hash);
+    let bytes = rpc.call(proxy, pool_data_calldata(), pinned).await?;
+    let page = abi::getPoolDataCall::abi_decode_returns_validate(&bytes)
+        .map_err(|e| Error::Abi(e.to_string()))?;
+    let tokens: Vec<_> = page
+        .tokens
+        .iter()
+        .filter(|t| is_xstock(t.token))
+        .map(|t| t.token)
+        .collect();
+    let mut calls = Vec::new();
+    for token in &tokens {
+        calls.push((
+            *token,
+            abi::sharesOfCall { holder: proxy }.abi_encode().into(),
+        ));
+        calls.push((*token, abi::getCurrentMultiplierCall {}.abi_encode().into()));
+    }
+    let results = rpc.calls(calls, pinned).await?;
+    if results.len() != 2 * tokens.len() {
+        return Err(Error::Rpc("incomplete issuer batch".into()));
+    }
+    let mut shares = ShareBalances::new();
+    for (token, pair) in tokens.into_iter().zip(results.chunks_exact(2)) {
+        shares.insert(
+            token,
+            ShareBalance {
+                shares: abi::sharesOfCall::abi_decode_returns_validate(&pair[0])
+                    .map_err(|e| Error::Abi(e.to_string()))?,
+                multiplier: abi::getCurrentMultiplierCall::abi_decode_returns_validate(&pair[1])
+                    .map_err(|e| Error::Abi(e.to_string()))?
+                    .multiplier,
+            },
+        );
+    }
+    let model = decode_pool_data(proxy, &bytes, pinned, shares)?;
+    if model.state().block != header.into() {
+        return Err(Error::InvalidData(
+            "pool and header context disagree".into(),
+        ));
+    }
+    Ok(model)
 }

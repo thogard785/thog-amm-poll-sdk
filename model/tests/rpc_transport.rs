@@ -12,63 +12,72 @@ use tokio::{
 };
 
 #[tokio::test]
-async fn each_snapshot_is_one_wire_request_for_the_complete_registry() {
+async fn snapshot_pins_pool_and_issuer_batches_to_one_hash() {
     let f = support::fixture();
     let p = support::page(&f.samples[0].snapshot);
-    let hash = support::hash(p.blockNumber.to::<u64>(), 0);
     let number = p.blockNumber.to::<u64>();
+    let header = support::header(number, f.baseFee);
+    let hash = header.hash;
     let proxy = f.proxy;
+    let shares = support::shares_for(&p);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let result = json!(thogamm_model::Bytes::from(
-        abi::getPoolDataCall::abi_encode_returns(&p)
-    ));
     let server = tokio::spawn(async move {
         for block in [
             CallBlock::Latest,
             CallBlock::Hash(hash),
             CallBlock::Number(number),
         ] {
-            let (mut connection, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut connection).await;
-            assert!(request.is_object(), "JSON-RPC batching is forbidden");
-            assert_eq!(request["method"], "eth_call");
-            assert_eq!(request["params"], pool_data_params(proxy, block));
-            // Without this, Monad can expose BASEFEE=0 in the returned state.
-            assert_eq!(request["params"][0]["gasPrice"], "0x1");
-            assert_eq!(request["params"][1], block.rpc_value());
-            assert_eq!(
-                request["params"][0]["data"],
-                json!(thogamm_model::Bytes::from(
-                    abi::getPoolDataCall {
-                        startTokenIndex: 0,
-                        stopTokenIndex: 32
+            for phase in 0..3 {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut connection).await;
+                let response = if phase == 0 {
+                    assert_eq!(request["method"], if matches!(block, CallBlock::Hash(_)) { "eth_getBlockByHash" } else { "eth_getBlockByNumber" });
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":header})
+                } else {
+                    let calls = request.as_array().unwrap();
+                    assert_eq!(calls.len(), if phase == 1 {1} else {10});
+                    let mut responses = Vec::new();
+                    for call in calls {
+                        assert_eq!(call["method"], "eth_call");
+                        assert_eq!(call["params"][0]["gasPrice"], "0x1");
+                        assert_eq!(call["params"][1], CallBlock::Hash(hash).rpc_value());
+                        let to: thogamm_model::Address = serde_json::from_value(call["params"][0]["to"].clone()).unwrap();
+                        let data: thogamm_model::Bytes = serde_json::from_value(call["params"][0]["data"].clone()).unwrap();
+                        let result = if phase == 1 {
+                            assert_eq!(call["params"], pool_data_params(proxy, CallBlock::Hash(hash)));
+                            abi::getPoolDataCall::abi_encode_returns(&p)
+                        } else if data.starts_with(&abi::sharesOfCall::SELECTOR) {
+                            assert_eq!(abi::sharesOfCall::abi_decode_validate(&data).unwrap().holder, proxy);
+                            abi::sharesOfCall::abi_encode_returns(&shares[&to].shares)
+                        } else {
+                            assert_eq!(data.as_ref(), abi::getCurrentMultiplierCall {}.abi_encode());
+                            abi::getCurrentMultiplierCall::abi_encode_returns(&abi::getCurrentMultiplierReturn {
+                                multiplier:shares[&to].multiplier, activation:thogamm_model::U256::ZERO, period:thogamm_model::U256::ZERO
+                            })
+                        };
+                        responses.push(json!({"jsonrpc":"2.0","id":call["id"],"result":thogamm_model::Bytes::from(result)}));
                     }
-                    .abi_encode()
-                ))
-            );
-            let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
-            connection.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).as_bytes()).await.unwrap();
+                    responses.reverse(); // Batch response order is not request order.
+                    json!(responses)
+                }.to_string();
+                connection.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).as_bytes()).await.unwrap();
+            }
         }
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let rpc = HttpRpc::new(url).unwrap();
-        let latest = snapshot(&rpc, f.proxy, CallBlock::Latest).await.unwrap();
-        assert_eq!(
-            latest.state(),
-            support::polled_model(f.proxy, &f.samples[0].snapshot).state()
-        );
-        let pinned = snapshot(&rpc, f.proxy, CallBlock::Hash(hash))
-            .await
-            .unwrap();
-        assert_eq!(
-            pinned.state(),
-            support::model(f.proxy, f.baseFee, &f.samples[0].snapshot).state()
-        );
-        let numbered = snapshot(&rpc, f.proxy, CallBlock::Number(number))
-            .await
-            .unwrap();
-        assert_eq!(numbered.state(), latest.state());
+        let expected = support::model(f.proxy, f.baseFee, &f.samples[0].snapshot);
+        for block in [
+            CallBlock::Latest,
+            CallBlock::Hash(hash),
+            CallBlock::Number(number),
+        ] {
+            assert_eq!(
+                snapshot(&rpc, f.proxy, block).await.unwrap().state(),
+                expected.state()
+            );
+        }
         server.await.unwrap();
     })
     .await
@@ -113,7 +122,10 @@ async fn http_redirect_is_reported_without_a_second_request() {
     let redirect = format!("{url}/redirected");
     let server = tokio::spawn(async move {
         let (mut connection, _) = listener.accept().await.unwrap();
-        assert_eq!(read_request(&mut connection).await["method"], "eth_call");
+        assert_eq!(
+            read_request(&mut connection).await["method"],
+            "eth_getBlockByNumber"
+        );
         connection.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         drop(connection);
         assert!(

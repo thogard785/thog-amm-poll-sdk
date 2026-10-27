@@ -13,7 +13,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(std::env::VarError::NotPresent) => CallBlock::Latest,
         Err(error) => return Err(error.into()),
     };
-    let model = decode_pool_data(proxy, &bytes, block)?;
+    let shares = serde_json::from_str(&std::fs::read_to_string(std::env::var(
+        "SHARE_STATE_FILE",
+    )?)?)?;
+    let model = decode_pool_data(proxy, &bytes, block, shares)?;
     let gas_price: U256 = std::env::var("EFFECTIVE_GAS_PRICE_WEI")?.parse()?;
     let pair = model.prepare(input, output)?;
     for amount in std::env::var("AMOUNTS_IN")?.split(',') {

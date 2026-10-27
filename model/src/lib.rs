@@ -6,7 +6,9 @@ pub mod events;
 pub mod math;
 pub mod model;
 pub mod rpc;
+pub mod shares;
 pub mod state;
+pub use shares::{Multipliers, ShareBalance, ShareBalances};
 
 pub use alloy_primitives::{Address, Bytes, B256, I256, U256};
 pub use model::{Fraction, Limits, PoolModel, PreparedPair, Quote};

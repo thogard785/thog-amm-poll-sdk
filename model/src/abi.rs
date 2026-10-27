@@ -1,4 +1,4 @@
-//! Exact schema-7 ABI of the deployed ThogAMM proxy.
+//! Exact schema-8 ABI of the deployed ThogAMM proxy.
 use alloy_sol_types::sol;
 sol! {
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -31,7 +31,7 @@ sol! {
         uint32 inventoryCap; // same encoding, denominated in USD wei
     }
 
-    // Decoded word: the physical 1<<255 empty marker is returned as zero.
+    // Logical word: getPoolData already decodes storage markers and the inventory zero bitmap.
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     struct StorageWord {
         uint16 slot;
@@ -69,6 +69,10 @@ sol! {
     event MakerLendingExposureUpdated(uint8 indexed venue, uint8 indexed category, uint32 sequence, int64 offset);
     event MakerTokenAdded(uint8 indexed tokenIndex, address indexed token, TokenMetadata metadata, CategoryMetadata categoryMetadata, uint256 balance);
     event MakerTokenRetired(uint8 indexed retiredIndex, address indexed token, uint8 movedFrom, uint32 generation);
+    function sharesOf(address holder) external view returns (uint256 shares);
+    function getCurrentMultiplier() external view returns (uint256 multiplier, uint256 activation, uint256 period);
+    event MakerInventoryUpdated(uint8 indexed index, address indexed token, uint128 balance);
+    event TransferShares(address indexed from, address indexed to, uint256 value);
     event MakerWmonBalanceCheckpoint(uint256 balance);
     event NativeBalanceCheckpoint(uint256 balance);
     event Paused(bool paused);

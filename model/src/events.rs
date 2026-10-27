@@ -11,7 +11,7 @@ fn decode<E: SolEvent>(log: &RpcLog) -> Result<E> {
         .map_err(|e| Error::Abi(e.to_string()))
 }
 fn invalid() -> Error {
-    Error::InvalidData("invalid schema-7 publication".into())
+    Error::InvalidData("invalid schema-8 publication".into())
 }
 fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<()> {
     let tokens = state.tokens.len();
@@ -36,7 +36,7 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
                 .position(|t| t.token == address)
                 .ok_or_else(invalid)?;
             state.set_bits(
-                120 + (i / 10) as u16,
+                101 + (i / 10) as u16,
                 i % 10 * 24,
                 24,
                 U256::from(crate::model::encode_cap(limit)),
@@ -48,7 +48,7 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
                 return Err(invalid());
             }
             state.set_bits(
-                124 + (c / 10) as u16,
+                104 + (c / 10) as u16,
                 c % 10 * 24,
                 24,
                 U256::from(crate::model::encode_cap(limit)),
@@ -69,7 +69,7 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
             1 => {
                 if words.len() != 1 + tokens.div_ceil(4)
                     || f(81, 8) != U256::from(tokens)
-                    || f(89, 8) != U256::from(7)
+                    || f(89, 8) != U256::from(8)
                     || f(97, 32) != generation
                     || !(h >> 129usize).is_zero()
                     || block > u32::MAX as u64
@@ -77,7 +77,7 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
                     return Err(invalid());
                 }
                 for (i, word) in words[1..].iter().enumerate() {
-                    state.words.insert(21 + i as u16, *word);
+                    state.words.insert(20 + i as u16, *word);
                 }
                 state.set_bits(2, 20, 16, f(0, 16))?;
                 state.set_bits(2, 36, 32, U256::from(block))?;
@@ -85,7 +85,7 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
                 state.set_bits(2, 133, 1, f(16, 1))?;
             }
             2 => {
-                if f(0, 8) != U256::from(7)
+                if f(0, 8) != U256::from(8)
                     || f(8, 8) != U256::from(tokens)
                     || f(16, 8) != U256::from(categories)
                     || !f(80, 32).is_zero()
@@ -105,15 +105,15 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
                 let mut cursor = 1;
                 for i in 0..cat_words {
                     state.set_bits(
-                        29 + i as u16,
+                        27 + i as u16,
                         0,
-                        if i == 10 { 170 } else { 255 },
+                        if i == 9 { 85 } else { 255 },
                         words[cursor],
                     )?;
                     cursor += 1;
                 }
                 for i in 0..covariance_words {
-                    state.words.insert(40 + i as u16, words[cursor]);
+                    state.words.insert(37 + i as u16, words[cursor]);
                     cursor += 1;
                 }
                 for i in 0..tokens {
@@ -123,7 +123,7 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
                 }
                 cursor += policy_words;
                 for i in 0..pair_words {
-                    state.words.insert(73 + i as u16, words[cursor]);
+                    state.words.insert(63 + i as u16, words[cursor]);
                     cursor += 1;
                 }
                 state.set_bits(2, 134, 1, U256::ONE)?;
@@ -135,7 +135,7 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
             4 => {
                 let wrapper_words = tokens.div_ceil(3);
                 if words.len() != 1 + wrapper_words + categories.div_ceil(4)
-                    || f(0, 8) != U256::from(7)
+                    || f(0, 8) != U256::from(8)
                     || f(8, 8) != U256::from(tokens)
                     || f(16, 8) != U256::from(categories)
                     || !f(24, 8).is_zero()
@@ -144,19 +144,19 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
                 {
                     return Err(invalid());
                 }
-                let mut coefficients = [U256::ZERO; 8];
+                let mut coefficients = [U256::ZERO; 7];
                 for i in 0..tokens {
                     let policy = (words[1 + i / 3] >> (i % 3 * 76)) & mask(76);
                     coefficients[i / 4] |= (policy & mask(64)) << (i % 4 * 64);
                     state.set_bits(9 + (i / 3) as u16, i % 3 * 75 + 31, 12, policy >> 64usize)?;
                 }
                 for (i, coefficient) in coefficients.iter().enumerate().take(tokens.div_ceil(4)) {
-                    state.words.insert(104 + i as u16, *coefficient);
+                    state.words.insert(87 + i as u16, *coefficient);
                 }
                 for i in 0..categories.div_ceil(4) {
                     state
                         .words
-                        .insert(112 + i as u16, words[1 + wrapper_words + i]);
+                        .insert(94 + i as u16, words[1 + wrapper_words + i]);
                 }
                 state.set_bits(2, 135, 1, U256::ONE)?;
             }
@@ -172,8 +172,13 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
 }
 /// Returns a new image only after every log was checked. Never double-count swap events
 /// alongside Transfer: maker/taker events are inventory checkpoints, not balance deltas.
-pub fn apply_block(previous: &PoolState, block: BlockHeader, logs: &[RpcLog]) -> Result<PoolState> {
-    apply_owned_block(previous.clone(), block, logs)
+pub fn apply_block(
+    previous: &PoolState,
+    block: BlockHeader,
+    logs: &[RpcLog],
+    multipliers: &crate::Multipliers,
+) -> Result<PoolState> {
+    apply_owned_block(previous.clone(), block, logs, multipliers)
 }
 /// Apply a complete block to an owned, unpublished candidate. Ownership avoids
 /// copying the image at each block of a finalized ancestry; failure discards the
@@ -182,6 +187,7 @@ pub fn apply_owned_block<'a>(
     mut next: PoolState,
     block: BlockHeader,
     logs: impl IntoIterator<Item = &'a RpcLog>,
+    multipliers: &crate::Multipliers,
 ) -> Result<PoolState> {
     if block.number != next.block.number.checked_add(1).ok_or(Error::Arithmetic)?
         || Some(block.parent_hash) != next.block.hash
@@ -226,12 +232,21 @@ pub fn apply_owned_block<'a>(
                     return Err(invalid());
                 }
                 next.set_bits(
-                    29 + (c / 3) as u16,
+                    27 + (c / 3) as u16,
                     c % 3 * 85,
                     64,
                     U256::from(e.offset as u64),
                 )?;
                 next.set_bits(7, 160, 32, U256::from(e.sequence))?;
+            } else if *topic == abi::MakerInventoryUpdated::SIGNATURE_HASH {
+                let e = decode::<abi::MakerInventoryUpdated>(log)?;
+                let i = usize::from(e.index);
+                if next.tokens.get(i).map(|t| t.token) != Some(e.token) {
+                    return Err(invalid());
+                }
+                let slot = 107 + (i / 2) as u16;
+                next.set_bits(slot, i % 2 * 128, 128, U256::from(e.balance))?;
+                next.set_bits(121, i / 2, 1, U256::from(next.word(slot)?.is_zero() as u8))?;
             } else if *topic == abi::MakerWmonBalanceCheckpoint::SIGNATURE_HASH {
                 let i = next
                     .tokens
@@ -250,7 +265,23 @@ pub fn apply_owned_block<'a>(
                 )?;
             }
         } else if let Some(index) = next.tokens.iter().position(|t| t.token == log.address) {
-            if *topic == abi::Transfer::SIGNATURE_HASH {
+            if crate::shares::is_xstock(log.address) {
+                if *topic == abi::TransferShares::SIGNATURE_HASH {
+                    let e = decode::<abi::TransferShares>(log)?;
+                    let holding = next
+                        .share_balances
+                        .get_mut(&log.address)
+                        .ok_or_else(invalid)?;
+                    if e.from != e.to {
+                        if e.from == next.proxy {
+                            holding.shares = sub(holding.shares, e.value)?;
+                        }
+                        if e.to == next.proxy {
+                            holding.shares = add(holding.shares, e.value)?;
+                        }
+                    }
+                }
+            } else if *topic == abi::Transfer::SIGNATURE_HASH {
                 let e = decode::<abi::Transfer>(log)?;
                 // Self-transfers are a no-op, even at a uint256 balance boundary.
                 if e.from == e.to {
@@ -276,6 +307,7 @@ pub fn apply_owned_block<'a>(
             }
         }
     }
+    next.update_multipliers(multipliers)?;
     next.block = block.into();
     next.validate()?;
     Ok(next)
@@ -287,8 +319,8 @@ pub fn log_filters(proxy: Address, wmon: Address) -> Vec<serde_json::Value> {
     let owner = alloy_primitives::B256::from(proxy.into_word());
     vec![
         json!({"address":proxy}),
-        json!({"topics":[abi::Transfer::SIGNATURE_HASH,owner]}),
-        json!({"topics":[abi::Transfer::SIGNATURE_HASH,null,owner]}),
+        json!({"topics":[[abi::Transfer::SIGNATURE_HASH,abi::TransferShares::SIGNATURE_HASH],owner]}),
+        json!({"topics":[[abi::Transfer::SIGNATURE_HASH,abi::TransferShares::SIGNATURE_HASH],null,owner]}),
         json!({"address":wmon,"topics":[[abi::Deposit::SIGNATURE_HASH,abi::Withdrawal::SIGNATURE_HASH],owner]}),
     ]
 }

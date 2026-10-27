@@ -11,7 +11,13 @@ fn externally_fetched_state_supports_all_quote_surfaces_without_a_reader() {
     let set = &f.samples[0];
     let number = support::page(&set.snapshot).blockNumber.to::<u64>();
     // There is no RPC client or SDK background task in this path.
-    let model = decode_pool_data(f.proxy, &set.snapshot, CallBlock::Number(number)).unwrap();
+    let model = decode_pool_data(
+        f.proxy,
+        &set.snapshot,
+        CallBlock::Number(number),
+        support::shares_for(&support::page(&f.samples[0].snapshot)),
+    )
+    .unwrap();
     let reference = support::model(f.proxy, f.baseFee, &set.snapshot);
     for sample in &set.quotes {
         let a = model.state().tokens[sample.inputIndex as usize].token;
@@ -62,7 +68,13 @@ fn externally_fetched_state_supports_all_quote_surfaces_without_a_reader() {
     }
     assert!(model.state().block.hash.is_none());
     let hash = support::hash(number, 0);
-    let pinned = decode_pool_data(f.proxy, &set.snapshot, CallBlock::Hash(hash)).unwrap();
+    let pinned = decode_pool_data(
+        f.proxy,
+        &set.snapshot,
+        CallBlock::Hash(hash),
+        support::shares_for(&support::page(&f.samples[0].snapshot)),
+    )
+    .unwrap();
     assert_eq!(pinned.state(), reference.state());
     assert_eq!(
         pool_data_params(f.proxy, CallBlock::Number(number))[1],
@@ -76,30 +88,44 @@ fn external_state_rejects_bad_abi_incomplete_registry_schema_and_wrong_block() {
     let bytes = &f.samples[0].snapshot;
     let mut page = support::page(bytes);
     let number = page.blockNumber.to::<u64>();
-    assert!(decode_pool_data(f.proxy, &bytes[..bytes.len() - 1], CallBlock::Latest).is_err());
-    assert!(decode_pool_data(f.proxy, bytes, CallBlock::Number(number + 1)).is_err());
+    assert!(decode_pool_data(
+        f.proxy,
+        &bytes[..bytes.len() - 1],
+        CallBlock::Latest,
+        support::shares_for(&support::page(&f.samples[0].snapshot))
+    )
+    .is_err());
+    assert!(decode_pool_data(
+        f.proxy,
+        bytes,
+        CallBlock::Number(number + 1),
+        support::shares_for(&support::page(&f.samples[0].snapshot))
+    )
+    .is_err());
     page.schemaVersion = 5;
     assert!(matches!(
         decode_pool_data(
             f.proxy,
             &abi::getPoolDataCall::abi_encode_returns(&page),
-            CallBlock::Latest
+            CallBlock::Latest,
+            support::shares_for(&support::page(&f.samples[0].snapshot))
         ),
         Err(Error::UnsupportedSchema(5))
     ));
-    page.schemaVersion = 7;
+    page.schemaVersion = 8;
     page.tokens.pop();
     page.balances.pop();
     assert!(decode_pool_data(
         f.proxy,
         &abi::getPoolDataCall::abi_encode_returns(&page),
-        CallBlock::Latest
+        CallBlock::Latest,
+        support::shares_for(&support::page(&f.samples[0].snapshot))
     )
     .is_err());
 }
 
 #[tokio::test]
-async fn caller_selected_historical_block_is_one_call_without_head_discovery() {
+async fn historical_reads_are_pinned_to_the_requested_block() {
     let f = support::fixture();
     let rpc = support::MockRpc::from_events(&f);
     let number = rpc.0.lock().unwrap().head;
@@ -107,7 +133,7 @@ async fn caller_selected_historical_block_is_one_call_without_head_discovery() {
     let model = snapshot(&rpc, f.proxy, CallBlock::Number(number))
         .await
         .unwrap();
-    assert_eq!(rpc.call_count(), 1);
+    assert_eq!(rpc.call_count(), 11);
     assert_eq!(model.state().block.number, number);
     assert_eq!(model.state().block.base_fee_per_gas, f.baseFee);
 }

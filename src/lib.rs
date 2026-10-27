@@ -1,5 +1,5 @@
 //! Read ThogAMM pool state once, then quote trade sizes locally in your aggregator.
-//! Each refresh makes exactly one eth_call and includes newly listed tokens.
+//! Refreshes pin pool and issuer reads to one block hash, including new listings.
 use std::time::Duration;
 pub use thogamm_model::rpc::{
     decode_pool_data, pool_data_calldata, pool_data_params, snapshot, CallBlock, ChainReader,
@@ -27,7 +27,7 @@ pub struct StatePollSdk<R = HttpRpc> {
 }
 impl StatePollSdk<HttpRpc> {
     /// Connect using a Monad HTTP RPC endpoint and the ThogAMM pool address.
-    /// Loads the initial state with one call. Keep this client for later quotes.
+    /// Loads the initial pool and issuer state. Keep this client for later quotes.
     pub async fn connect(
         http_url: impl Into<String>,
         proxy: Address,
@@ -37,7 +37,7 @@ impl StatePollSdk<HttpRpc> {
     }
 }
 impl<R: ChainReader> StatePollSdk<R> {
-    /// Load initial state through your own RPC client with one call.
+    /// Load initial state through your own RPC client.
     pub async fn with_reader(reader: R, proxy: Address, config: Config) -> Result<Self> {
         if config.poll_interval.is_zero() {
             return Err(Error::InvalidData("poll interval must be positive".into()));
@@ -53,8 +53,7 @@ impl<R: ChainReader> StatePollSdk<R> {
     pub fn model(&self) -> &PoolModel {
         &self.model
     }
-    /// Exactly one eth_call on every invocation, including unchanged blocks and
-    /// errors. Publishes the complete returned image or preserves the last image.
+    /// Reads a complete block-pinned image, then publishes it atomically.
     /// `false` means the returned quote state and block context are unchanged.
     pub async fn refresh(&mut self) -> Result<bool> {
         let next = snapshot(&self.reader, self.model.state().proxy, CallBlock::Latest).await?;
@@ -70,8 +69,7 @@ impl<R: ChainReader> StatePollSdk<R> {
         self.model = next;
         Ok(true)
     }
-    /// Wait one polling interval, then make exactly one call. Return the model
-    /// even if unchanged; waiting for a change must not hide additional calls.
+    /// Wait one polling interval and refresh once, returning even if unchanged.
     pub async fn next_update(&mut self) -> Result<&PoolModel> {
         tokio::time::sleep(self.config.poll_interval).await;
         self.refresh().await?;

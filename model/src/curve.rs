@@ -1,4 +1,4 @@
-//! Integer curve of the deployed schema-7 contract. No floating-point arithmetic.
+//! Integer curve of the deployed schema-8 contract. No floating-point arithmetic.
 use crate::{
     math::*,
     model::{Fraction, Quote},
@@ -8,6 +8,9 @@ use alloy_primitives::U512;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Curve {
+    pub balances: [U256; 28],
+    pub input_dust: U256,
+    pub output_dust: U256,
     pub input: usize,
     pub output: usize,
     pub price_in: U256,
@@ -38,7 +41,12 @@ impl Curve {
         if amount > self.input_limit {
             return Err(Error::LimitExceeded(self.input_limit));
         }
-        let n = mul_div(amount, self.price_in, self.input_scale, false)?;
+        let n = mul_div(
+            amount.saturating_sub(self.input_dust),
+            self.price_in,
+            self.input_scale,
+            false,
+        )?;
         let mut q = Quote {
             amount_in: amount,
             amount_out: U256::ZERO,
@@ -67,6 +75,7 @@ impl Curve {
         if friction {
             q.amount_out = mul_div(q.amount_out, u(9990), u(10000), false)?;
         }
+        q.amount_out = q.amount_out.saturating_sub(self.output_dust);
         Ok(q)
     }
 
@@ -195,7 +204,12 @@ impl Curve {
         })
     }
     pub fn remaining_slope(&self, amount: U256) -> Result<U256> {
-        let n = mul_div(amount, self.price_in, self.input_scale, false)?;
+        let n = mul_div(
+            amount.saturating_sub(self.input_dust),
+            self.price_in,
+            self.input_scale,
+            false,
+        )?;
         let base = mul_div(
             sub(u(1_000_000), self.spread)?,
             pow10(36),
@@ -265,10 +279,18 @@ impl Curve {
         if target.is_zero() {
             return self.quote(U256::ZERO, friction);
         }
-        let target_usd = mul_div(target, self.price_out, self.output_scale, true)?;
-        let mut high = mul_div(target_usd, self.input_scale, self.price_in, true)?
-            .max(U256::ONE)
-            .min(self.input_limit);
+        let target_usd = mul_div(
+            add(target, self.output_dust)?,
+            self.price_out,
+            self.output_scale,
+            true,
+        )?;
+        let mut high = add(
+            mul_div(target_usd, self.input_scale, self.price_in, true)?,
+            self.input_dust,
+        )?
+        .max(U256::ONE)
+        .min(self.input_limit);
         let mut low = U256::ZERO;
         let mut q = self.quote(high, friction)?;
         while q.amount_out < target {

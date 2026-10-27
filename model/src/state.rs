@@ -79,13 +79,14 @@ pub struct RpcLog {
     pub removed: bool,
 }
 
-/// Atomic schema-7 page plus all registered ERC-20 balances and native MON.
+/// Atomic schema-8 page plus all registered ERC-20 balances and native MON.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolState {
     pub proxy: Address,
     pub block: BlockContext,
     pub tokens: Vec<TokenMetadata>,
     pub balances: Vec<U256>,
+    pub share_balances: crate::shares::ShareBalances,
     pub native_balance: U256,
     pub categories: Vec<CategoryMetadata>,
     pub words: BTreeMap<u16, U256>,
@@ -97,27 +98,33 @@ pub fn reference(slot: u16, offset: usize, width: usize) -> u32 {
 }
 
 impl PoolState {
-    pub fn from_snapshot(proxy: Address, page: PoolData, hash: Option<B256>) -> Result<Self> {
+    pub fn from_snapshot(
+        proxy: Address,
+        page: PoolData,
+        hash: Option<B256>,
+        share_balances: crate::shares::ShareBalances,
+    ) -> Result<Self> {
         let block = BlockContext {
             number: page.blockNumber.try_into().map_err(|_| Error::Arithmetic)?,
             hash,
             parent_hash: page.parentBlockHash,
             base_fee_per_gas: page.baseFeePerGas,
         };
-        Self::from_pages(proxy, block, vec![page])
+        Self::from_pages(proxy, block, vec![page], share_balances)
     }
 
     pub fn from_pages(
         proxy: Address,
         block: impl Into<BlockContext>,
         pages: Vec<PoolData>,
+        share_balances: crate::shares::ShareBalances,
     ) -> Result<Self> {
         let block = block.into();
         let first = pages
             .first()
             .ok_or_else(|| Error::InvalidData("no pages".into()))?;
         let count = usize::from(first.tokenCount);
-        if !(1..=32).contains(&count) || !(1..=32).contains(&first.categories.len()) {
+        if !(1..=28).contains(&count) || !(1..=28).contains(&first.categories.len()) {
             return Err(Error::InvalidData("invalid registry dimensions".into()));
         }
         let categories = first.categories.clone();
@@ -126,7 +133,7 @@ impl PoolState {
         let mut tokens = vec![None; count];
         let mut words = BTreeMap::new();
         for page in pages {
-            if page.schemaVersion != 7 {
+            if page.schemaVersion != 8 {
                 return Err(Error::UnsupportedSchema(page.schemaVersion));
             }
             if page.blockNumber != U256::from(block.number)
@@ -178,6 +185,7 @@ impl PoolState {
             block,
             tokens,
             balances,
+            share_balances,
             native_balance,
             categories,
             words,
@@ -186,6 +194,66 @@ impl PoolState {
         Ok(state)
     }
 
+    pub fn physical_units(&self, index: usize) -> U256 {
+        self.share_balances
+            .get(&self.tokens[index].token)
+            .map_or(self.balances[index], |b| b.shares)
+    }
+    pub fn amount_for_units(&self, index: usize, units: U256) -> Result<U256> {
+        match self.share_balances.get(&self.tokens[index].token) {
+            Some(b) => crate::math::mul_div(units, b.multiplier, crate::math::pow10(18), false),
+            None => Ok(units),
+        }
+    }
+    pub fn transfer_units(&self, index: usize, amount: U256) -> Result<U256> {
+        match self.share_balances.get(&self.tokens[index].token) {
+            Some(b) => crate::math::mul_div(amount, crate::math::pow10(18), b.multiplier, false),
+            None => Ok(amount),
+        }
+    }
+    pub fn transfer_dust(&self, index: usize) -> Result<U256> {
+        match self.share_balances.get(&self.tokens[index].token) {
+            Some(b) => {
+                Ok(
+                    crate::math::mul_div(b.multiplier, U256::ONE, crate::math::pow10(18), true)?
+                        .max(U256::from(2)),
+                )
+            }
+            None => Ok(U256::ZERO),
+        }
+    }
+    /// The two endpoints reconcile physical units; other tokens retain their ledger units.
+    pub fn pair_balances(&self, input: usize, output: usize) -> Result<[U256; 28]> {
+        if self.physical_units(input) > mask(128) || self.physical_units(output) > mask(128) {
+            return Err(Error::Unavailable("inventory uint128"));
+        }
+        let mut balances = [U256::ZERO; 28];
+        for (i, balance) in balances.iter_mut().enumerate().take(self.tokens.len()) {
+            *balance = if i == input || i == output {
+                self.balances[i]
+            } else {
+                self.amount_for_units(i, self.packed(107, i, 128, 2)?)?
+            };
+        }
+        Ok(balances)
+    }
+    pub fn update_multipliers(&mut self, multipliers: &crate::shares::Multipliers) -> Result<()> {
+        if multipliers.len() != self.share_balances.len() {
+            return Err(Error::InvalidData("incomplete xStock multipliers".into()));
+        }
+        for (token, balance) in &mut self.share_balances {
+            balance.multiplier = *multipliers
+                .get(token)
+                .filter(|m| !m.is_zero())
+                .ok_or_else(|| Error::InvalidData("missing xStock multiplier".into()))?;
+        }
+        for i in 0..self.tokens.len() {
+            if self.share_balances.contains_key(&self.tokens[i].token) {
+                self.balances[i] = self.amount_for_units(i, self.physical_units(i))?;
+            }
+        }
+        Ok(())
+    }
     pub fn word(&self, slot: u16) -> Result<U256> {
         self.words
             .get(&slot)
@@ -224,7 +292,7 @@ impl PoolState {
         Ok(())
     }
     pub fn price(&self, index: usize, upper: bool) -> Result<U256> {
-        let packed = self.packed(21, index, 64, 4)?;
+        let packed = self.packed(20, index, 64, 4)?;
         let mantissa = packed & mask(56);
         let exponent = (packed >> 56usize).to::<u8>();
         // The deployed decoder returns zero for invalid fields. Context rejects
@@ -244,7 +312,7 @@ impl PoolState {
     pub fn refresh_categories(&mut self) -> Result<()> {
         for c in 0..self.categories.len() {
             let anchor = self
-                .bits(29 + (c / 3) as u16, c % 3 * 85 + 80, 5)?
+                .bits(27 + (c / 3) as u16, c % 3 * 85 + 80, 5)?
                 .to::<u8>();
             let token = self
                 .tokens
@@ -259,8 +327,8 @@ impl PoolState {
     pub fn validate(&self) -> Result<()> {
         let count = self.tokens.len();
         let categories = self.categories.len();
-        if !(1..=32).contains(&count)
-            || !(1..=32).contains(&categories)
+        if !(1..=28).contains(&count)
+            || !(1..=28).contains(&categories)
             || categories > count
             || self.balances.len() != count
             || self.words.len() != 126
@@ -270,28 +338,50 @@ impl PoolState {
         for slot in 2..128 {
             self.word(slot)?;
         }
-        if self.bits(2, 0, 8)? != U256::from(7)
+        if self.bits(2, 0, 8)? != U256::from(8)
             || self.bits(2, 8, 6)? != U256::from(count)
             || self.bits(2, 14, 6)? != U256::from(categories)
-            || self.bits(8, 160, 24)? != U256::from(7 | 7 << 8 | 1 << 16)
+            || self.bits(8, 160, 24)? != U256::from(8 | 8 << 8 | 2 << 16)
             || self.bits(8, 184, 32)?.is_zero()
         {
             return Err(Error::InvalidData(
                 "unsupported layout, wire, model or registry generation".into(),
             ));
         }
+        if self.share_balances.len()
+            != self
+                .tokens
+                .iter()
+                .filter(|t| crate::shares::is_xstock(t.token))
+                .count()
+        {
+            return Err(Error::InvalidData("unexpected xStock share state".into()));
+        }
         let mut addresses = BTreeSet::new();
         for (i, t) in self.tokens.iter().enumerate() {
+            if crate::shares::is_xstock(t.token) {
+                let holding = self
+                    .share_balances
+                    .get(&t.token)
+                    .ok_or_else(|| Error::InvalidData("missing xStock share state".into()))?;
+                if holding.multiplier.is_zero()
+                    || self.amount_for_units(i, holding.shares)? != self.balances[i]
+                {
+                    return Err(Error::InvalidData(
+                        "xStock shares and pool balance disagree".into(),
+                    ));
+                }
+            }
             let c = usize::from(t.category);
             let token_slot = 9 + (i / 3) as u16;
             let token_offset = i % 3 * 75;
             let catalog_id = self.token_bits(i, 0, 5)?.to::<usize>();
-            if self.packed(20, catalog_id, 6, 32)? != U256::from(i + 1) {
+            if self.packed(19, catalog_id, 6, 32)? != U256::from(i + 1) {
                 return Err(Error::InvalidData(
                     "registry index disagrees with token metadata".into(),
                 ));
             }
-            let category_slot = 29 + (c / 3) as u16;
+            let category_slot = 27 + (c / 3) as u16;
             let category_offset = c % 3 * 85;
             if t.token.is_zero()
                 || !addresses.insert(t.token)
@@ -304,7 +394,7 @@ impl PoolState {
                 return Err(Error::InvalidData("invalid token metadata".into()));
             }
             for (actual, expected) in [
-                (t.price, reference(21 + (i / 4) as u16, i % 4 * 64, 64)),
+                (t.price, reference(20 + (i / 4) as u16, i % 4 * 64, 64)),
                 (
                     t.tokenBidSpread,
                     reference(token_slot, token_offset + 15, 16),
@@ -324,7 +414,7 @@ impl PoolState {
                 (t.sequence, reference(2, 20, 16)),
                 (
                     t.inventoryCap,
-                    reference(120 + (i / 10) as u16, i % 10 * 24, 24),
+                    reference(101 + (i / 10) as u16, i % 10 * 24, 24),
                 ),
                 (
                     t.pairStart,
@@ -338,14 +428,14 @@ impl PoolState {
             ] {
                 if actual != expected {
                     return Err(Error::InvalidData(
-                        "metadata reference disagrees with schema 7".into(),
+                        "metadata reference disagrees with schema 8".into(),
                     ));
                 }
             }
         }
         for (c, m) in self.categories.iter().enumerate() {
             let anchor = self
-                .bits(29 + (c / 3) as u16, c % 3 * 85 + 80, 5)?
+                .bits(27 + (c / 3) as u16, c % 3 * 85 + 80, 5)?
                 .to::<usize>();
             let t = self
                 .tokens
@@ -358,7 +448,7 @@ impl PoolState {
                 || m.inventory != t.inventory
                 || m.spread != t.categorySpread
                 || m.postedBlock != t.postedBlock
-                || m.inventoryCap != reference(124 + (c / 10) as u16, c % 10 * 24, 24)
+                || m.inventoryCap != reference(104 + (c / 10) as u16, c % 10 * 24, 24)
             {
                 return Err(Error::InvalidData(
                     "category metadata disagrees with words".into(),
@@ -374,12 +464,12 @@ pub fn pair_location(mut a: usize, mut b: usize) -> (u16, usize) {
         std::mem::swap(&mut a, &mut b);
     }
     let field = b * (b - 1) / 2 + a;
-    (73 + (field / 16) as u16, field % 16 * 16)
+    (63 + (field / 16) as u16, field % 16 * 16)
 }
 pub fn covariance_location(mut a: usize, mut b: usize) -> (u16, usize) {
     if a > b {
         std::mem::swap(&mut a, &mut b);
     }
     let field = b * (b + 1) / 2 + a;
-    (40 + (field / 16) as u16, field % 16 * 16)
+    (37 + (field / 16) as u16, field % 16 * 16)
 }
