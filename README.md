@@ -1,7 +1,7 @@
 # ThogAMM polling SDK
 
 Read a complete ThogAMM snapshot, then quote any number of trade sizes locally.
-Version **0.4.1** supports **schema 8 / wire 8 / model 2** and the current 13-token
+Pending version **0.5.0** supports **schema 8 / wire 8 / model 3** and the current 13-token
 registry, including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped
 xStocks with 18 decimals. Addresses are in the [integration guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
 
@@ -9,11 +9,23 @@ xStocks with 18 decimals. Addresses are in the [integration guide](https://githu
 - Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`.
 - Rust **1.88+**, Cargo resolver **3**, Tokio. Commit your application's lockfile.
 
+This branch targets the pending model-3 contract upgrade. Released v0.4.1 is for
+model 2. The SDK rejects mismatched model identities; verify the pool's identity
+before switching. No v0.5.0 release tag is published by this PR. Pin a reviewed
+commit and commit Cargo.lock while testing this branch.
+
+The coordinated upgrade pauses both maker liquidity and taker execution while
+the shared operator backend is stopped, upgraded and restarted. The operator
+must confirm the new risk configuration and fresh valuations before unpausing;
+the migration preserves the previous widening. Reconnect using this matching SDK
+and obtain a complete snapshot after the upgrade. See
+[upgrade availability](https://github.com/thogard785/thog-amm-integration-guide/blob/codex/dynamic-maker-defense/THOGAMM_AGGREGATOR_INTEGRATION.md#upgrade-availability).
+
 ## Install and quote
 
 ```toml
 [dependencies]
-state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.4.1" }
+state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", branch = "codex/dynamic-maker-defense" }
 ```
 
 ```rust
@@ -61,6 +73,37 @@ accept `auction_handler_warm` as the final argument. Pass the transaction's
 **effective** gas price, not its maximum fee cap. The model reproduces the
 contract's share floors, dust and the distinct direct/Buy friction rounding.
 
+Execution applies a dynamic output reduction. Evaluate the following rows in
+order using the transaction's **effective** gas price and the current block's
+base fee; every gas-price comparison is strictly greater-than.
+
+| First matching condition | Raw defense | Defense after a valuation update earlier in this block |
+| --- | ---: | ---: |
+| FastLane AuctionHandler is already warm | 12 bp | 2 bp |
+| `gasPrice > 2.5 * baseFee` | 12 bp | 2 bp |
+| `gasPrice > 2 * baseFee` | 8 bp | 1 bp |
+| `gasPrice > 1.5 * baseFee` | 6 bp | 0.5 bp |
+| Otherwise | 0 bp | 0 bp |
+
+The same-block column applies exactly when the latest accepted valuation's
+`postedBlock` equals the execution block: `max(rawDefense / 4 - 1 bp, 0)`.
+A risk, wrapper, cap or inventory update alone does not qualify. The raw defense
+applies when the latest valuation is from an earlier block. Warmth and gas-price
+triggers do not stack. With zero base fee, any positive gas price selects 12 bp;
+a cold zero-price transaction selects zero. Fractional thresholds are exact,
+including odd base fees; implementations compare differences to avoid overflow.
+
+The configured age widening is **0.5 bp per elapsed block** without a valuation
+update (`widen_per_block_bps: 0.50`, encoded as 50 in 0.01 bp units). It adds to
+the pair's spread and affects both read-only and execution quotes. Execution
+defense is a separate multiplicative output reduction, not another age term.
+
+The SDK's default execution methods assume a cold AuctionHandler; the
+`*_with_context` methods accept explicit warmth. For EIP-1559, effective gas price
+is `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`. `at_block(number, base_fee)`
+sets both age and the block/base-fee context used by this policy; it cannot predict
+an intervening valuation publication, trade or inventory change.
+
 `Quote.amount_in` is the amount passed to Thog. For execution quotes,
 `amount_out` is guaranteed recipient credit at the quoted state/context:
 compare `received >= amount_out`, not equality. For Buy it equals the target;
@@ -71,7 +114,7 @@ not the requested transfer or its total balance. See the [funding example](https
 For an amount ladder, call `model.prepare(in, out)?` once and use the same methods
 on the returned pair, omitting token arguments. Clone models to share immutable
 state. Rebuild prepared pairs after updates. Independent quotes do not simulate
-successive fills. `at_block(number, base_fee)` changes price age only; it holds
+successive fills. `at_block(number, base_fee)` changes age and execution context; it holds
 inventory, policy and issuer multipliers fixed.
 
 ## Custom transport or offline state
@@ -108,10 +151,13 @@ pool/token/gas variables. Optional `BLOCK_NUMBER` checks the saved block.
 ## Verification and migration
 
 Run `cargo test --workspace --locked`. The [shared contract corpus](https://github.com/thogard785/thog-amm-integration-guide#verification)
-contains **39,936 comparisons**, plus 200 blocks of exact event replay. Expected
-results come from deployed contract reads and local fork execution.
+checks 32,760 execution cases captured from the newly compiled model-3 contract
+on a local Monad fork. It also reuses 25,896 historical read-only cases and
+200 blocks of event replay with a test-only identity migration; their expected
+results and stored historical bytes are unchanged. These historical captures
+are evidence for unchanged read-only/event semantics, not the new defense.
 
-Upgrade from 0.3 by switching to schema 8, supplying issuer state to offline
-constructors and implementing the new reader methods. Schema-7 snapshots are
-rejected. The [event SDK](https://github.com/thogard785/thog-amm-event-sdk) shares
+Upgrade from 0.4.1 alongside the contract's model-3 migration. The ABI and SDK
+quote signatures remain unchanged; execution results change with the new policy.
+Model-2 and schema-7 snapshots are rejected. The [event SDK](https://github.com/thogard785/thog-amm-event-sdk) shares
 this model. Both SDKs are [MIT licensed](LICENSE).

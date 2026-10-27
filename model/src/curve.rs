@@ -1,4 +1,4 @@
-//! Integer curve of the deployed schema-8 contract. No floating-point arithmetic.
+//! Integer curve of the schema-8/model-3 contract. No floating-point arithmetic.
 use crate::{
     math::*,
     model::{Fraction, Quote},
@@ -36,8 +36,36 @@ fn quadratic_denominator() -> U256 {
     u(2) * pow10(54)
 }
 
+// Hundredths of a basis point. Differences preserve strict half-base-fee
+// boundaries without overflowing at the top of the uint256 fee domain.
+pub(crate) fn execution_friction(gas_price: U256, base_fee: U256, hot: bool, fresh: bool) -> u64 {
+    let mut friction = 0;
+    if hot {
+        friction = 1200;
+    } else if gas_price > base_fee {
+        let priority_fee = gas_price - base_fee;
+        if priority_fee > base_fee {
+            friction = if priority_fee - base_fee > base_fee / u(2) {
+                1200
+            } else {
+                800
+            };
+        } else if priority_fee > base_fee / u(2) {
+            friction = 600;
+        }
+    }
+    if fresh && friction != 0 {
+        friction = friction / 4 - 100;
+    }
+    friction
+}
+
+pub(crate) fn apply_execution_friction(value: U256, friction: u64) -> Result<U256> {
+    mul_div(value, sub(u(1_000_000), u(friction))?, u(1_000_000), false)
+}
+
 impl Curve {
-    pub fn quote(&self, amount: U256, friction: bool) -> Result<Quote> {
+    pub fn quote(&self, amount: U256, friction: u64) -> Result<Quote> {
         if amount > self.input_limit {
             return Err(Error::LimitExceeded(self.input_limit));
         }
@@ -72,8 +100,8 @@ impl Curve {
         let output_usd = self.output_for_budget(available)?;
         q.wrapper_cost_usd_wad = ia(to_signed(entry)?, self.exit_cost(output_usd)?)?;
         q.amount_out = mul_div(output_usd, self.output_scale, self.price_out, false)?;
-        if friction {
-            q.amount_out = mul_div(q.amount_out, u(9990), u(10000), false)?;
+        if friction != 0 {
+            q.amount_out = apply_execution_friction(q.amount_out, friction)?;
         }
         q.amount_out = q.amount_out.saturating_sub(self.output_dust);
         Ok(q)
@@ -246,7 +274,7 @@ impl Curve {
                 denominator: U256::ONE,
             });
         }
-        let q = self.quote(amount, false)?;
+        let q = self.quote(amount, 0)?;
         let output_usd = mul_div(q.amount_out, self.price_out, self.output_scale, false)?;
         let mut denominator = add(pow10(36), mul(self.exit_fixed, pow10(18))?)?;
         if !self.exit_slope.is_zero() && output_usd < self.exit_inventory {
@@ -275,7 +303,7 @@ impl Curve {
             denominator,
         })
     }
-    pub fn solve_output(&self, target: U256, friction: bool) -> Result<Quote> {
+    pub fn solve_output(&self, target: U256, friction: u64) -> Result<Quote> {
         if target.is_zero() {
             return self.quote(U256::ZERO, friction);
         }
@@ -360,4 +388,80 @@ fn sqrt_ceil(value: U512) -> Result<U256> {
         return Err(Error::Arithmetic);
     }
     Ok(U256::from_limbs([limbs[0], limbs[1], limbs[2], limbs[3]]))
+}
+
+#[cfg(test)]
+mod execution_friction_tests {
+    use super::*;
+    use alloy_primitives::U512;
+
+    #[test]
+    fn strict_boundaries_warmth_and_same_block_discount() {
+        for (base, gas, raw) in [
+            (100, 0, 0),
+            (100, 150, 0),
+            (100, 151, 600),
+            (100, 160, 600),
+            (100, 200, 600),
+            (100, 201, 800),
+            (100, 250, 800),
+            (100, 251, 1200),
+            (3, 4, 0),
+            (3, 5, 600),
+            (3, 6, 600),
+            (3, 7, 800),
+            (3, 8, 1200),
+            (0, 0, 0),
+            (0, 1, 1200),
+        ] {
+            for hot in [false, true] {
+                for fresh in [false, true] {
+                    let expected = if hot { 1200 } else { raw };
+                    let expected = if fresh && expected != 0 {
+                        expected / 4 - 100
+                    } else {
+                        expected
+                    };
+                    assert_eq!(execution_friction(u(gas), u(base), hot, fresh), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_uint256_fees_match_wide_rational_oracle() {
+        let mut random = 0x1234_5678_9abc_def0u64;
+        let mut word = || {
+            let mut limbs = [0; 4];
+            for limb in &mut limbs {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                *limb = random;
+            }
+            U256::from_limbs(limbs)
+        };
+        let mut cases = vec![
+            (U256::MAX, U256::MAX),
+            (U256::MAX, U256::MAX / u(2)),
+            (U256::MAX, U256::MAX / u(3)),
+        ];
+        for _ in 0..1024 {
+            cases.push((word(), word()));
+        }
+        for (gas, base) in cases {
+            let g = U512::from(gas);
+            let b = U512::from(base);
+            let expected = if g * U512::from(2) > b * U512::from(5) {
+                1200
+            } else if g > b * U512::from(2) {
+                800
+            } else if g * U512::from(2) > b * U512::from(3) {
+                600
+            } else {
+                0
+            };
+            assert_eq!(execution_friction(gas, base, false, false), expected);
+        }
+    }
 }
