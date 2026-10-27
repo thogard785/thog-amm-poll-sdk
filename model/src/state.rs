@@ -341,7 +341,7 @@ impl PoolState {
         if self.bits(2, 0, 8)? != U256::from(8)
             || self.bits(2, 8, 6)? != U256::from(count)
             || self.bits(2, 14, 6)? != U256::from(categories)
-            || self.bits(8, 160, 24)? != U256::from(8 | 8 << 8 | 2 << 16)
+            || self.bits(8, 160, 24)? != U256::from(8 | 8 << 8 | 3 << 16)
             || self.bits(8, 184, 32)?.is_zero()
         {
             return Err(Error::InvalidData(

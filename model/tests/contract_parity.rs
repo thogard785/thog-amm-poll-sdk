@@ -21,7 +21,7 @@ fn projected_quotes_preserve_provenance_and_use_the_requested_block_context() {
         .quote_exact_input(a, b, amount)
         .is_err());
     let gas_price = f.baseFee * u(2) + U256::ONE;
-    // This effective gas price is below twice the projected block's base fee.
+    // This effective gas price is below 1.5 times the projected block's base fee.
     assert_eq!(
         next.quote_execution_exact_input(a, b, amount, gas_price)
             .unwrap()
@@ -30,7 +30,7 @@ fn projected_quotes_preserve_provenance_and_use_the_requested_block_context() {
     );
     let high = model.at_block(n + 1, f.baseFee).unwrap();
     assert_eq!(
-        high.quote_execution_exact_input(a, b, amount, f.baseFee * u(2))
+        high.quote_execution_exact_input(a, b, amount, f.baseFee + f.baseFee / u(2))
             .unwrap()
             .amount_out,
         high.quote_exact_input(a, b, amount).unwrap().amount_out
@@ -134,4 +134,64 @@ fn deployed_publications_preserve_spare_bits_and_replay_caps_and_readiness() {
         }
     }
     assert_eq!(stages.len(), 3);
+}
+
+#[test]
+fn legacy_execution_model_is_rejected() {
+    let f = support::fixture();
+    let model = support::model(f.proxy, f.baseFee, &f.samples[0].snapshot);
+    let mut state = model.into_state();
+    let metadata = state.words.get_mut(&8).unwrap();
+    *metadata = (*metadata & !(u(255) << 176usize)) | (u(2) << 176usize);
+    assert!(PoolModel::new(state).is_err());
+}
+
+#[test]
+fn projecting_to_next_block_removes_the_same_block_discount() {
+    use alloy_sol_types::SolCall;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(
+        &include_bytes!("../../tests/common/execution-model3.json.gz")[..],
+    )
+    .read_to_end(&mut bytes)
+    .unwrap();
+    let f: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let s = &f["snapshots"][0];
+    let encoded: thogamm_model::Bytes = s["snapshot"].as_str().unwrap().parse().unwrap();
+    let fresh = PoolModel::from_snapshot(
+        f["proxy"].as_str().unwrap().parse().unwrap(),
+        thogamm_model::abi::getPoolDataCall::abi_decode_returns_validate(&encoded).unwrap(),
+        None,
+        serde_json::from_value(s["shareBalances"].clone()).unwrap(),
+    )
+    .unwrap();
+    let base = fresh.quote_base_fee_per_gas();
+    let aged = fresh
+        .at_block(fresh.quote_block_number() + 1, base)
+        .unwrap();
+    let a = fresh.state().tokens[0].token;
+    let b = fresh.state().tokens[4].token;
+    let amount = u(1_000_000);
+    for (gas, warm, discounted, raw) in [
+        (base + base / u(2), false, 0, 0),
+        (base + base / u(2) + U256::ONE, false, 50, 600),
+        (base * u(2) + U256::ONE, false, 100, 800),
+        (base * u(2) + base / u(2) + U256::ONE, false, 200, 1200),
+        (base, true, 200, 1200),
+    ] {
+        for (model, units) in [(&fresh, discounted), (&aged, raw)] {
+            let read = model.quote_exact_input(a, b, amount).unwrap().amount_out;
+            let expected =
+                thogamm_model::math::mul_div(read, u(1_000_000 - units), u(1_000_000), false)
+                    .unwrap();
+            assert_eq!(
+                model
+                    .quote_execution_exact_input_with_context(a, b, amount, gas, warm)
+                    .unwrap()
+                    .amount_out,
+                expected
+            );
+        }
+    }
 }

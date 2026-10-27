@@ -1,5 +1,5 @@
 use crate::{
-    curve::Curve,
+    curve::{apply_execution_friction, execution_friction, Curve},
     math::*,
     state::{pair_location, WMON},
     Address, Error, PoolState, Result, I256, U256,
@@ -75,7 +75,8 @@ impl PoolModel {
     pub fn state(&self) -> &PoolState {
         &self.state
     }
-    /// Advance price age only; this does not predict intervening state changes.
+    /// Advance price age and execution fee/freshness context without predicting
+    /// intervening publications, trades, inventory or issuer changes.
     pub fn at_block(&self, number: u64, base_fee_per_gas: U256) -> Result<Self> {
         if number < self.state.block.number {
             return Err(Error::InvalidData(
@@ -433,7 +434,7 @@ impl PoolModel {
 
 impl PreparedPair<'_> {
     pub fn quote_exact_input(&self, amount: U256) -> Result<Quote> {
-        let q = self.curve.quote(amount, false)?;
+        let q = self.curve.quote(amount, 0)?;
         if amount.is_zero() || q.amount_out.is_zero() {
             return Err(Error::Unavailable("zero fill"));
         }
@@ -450,13 +451,17 @@ impl PreparedPair<'_> {
         gas_price: U256,
         auction_handler_warm: bool,
     ) -> Result<Quote> {
-        let friction =
-            auction_handler_warm || gas_price > mul(u(2), self.model.quote_base_fee_per_gas)?;
+        let friction = execution_friction(
+            gas_price,
+            self.model.quote_base_fee_per_gas,
+            auction_handler_warm,
+            self.curve.posted == self.model.quote_block_number,
+        );
         // makerSwapExactInput applies friction after the quoted xStock dust.
         // ERC-7815 Buy instead passes friction into the curve before dust.
-        let mut q = self.curve.quote(amount, false)?;
-        if friction {
-            q.amount_out = mul_div(q.amount_out, u(9990), u(10000), false)?;
+        let mut q = self.curve.quote(amount, 0)?;
+        if friction != 0 {
+            q.amount_out = apply_execution_friction(q.amount_out, friction)?;
         }
         if amount.is_zero() || q.amount_out.is_zero() {
             return Err(Error::Unavailable("zero fill"));
@@ -481,8 +486,12 @@ impl PreparedPair<'_> {
         if target > buy_limit {
             return Err(Error::LimitExceeded(buy_limit));
         }
-        let friction =
-            auction_handler_warm || gas_price > mul(u(2), self.model.quote_base_fee_per_gas)?;
+        let friction = execution_friction(
+            gas_price,
+            self.model.quote_base_fee_per_gas,
+            auction_handler_warm,
+            self.curve.posted == self.model.quote_block_number,
+        );
         let mut q = self.curve.solve_output(target, friction)?;
         if !target.is_zero() {
             self.model
@@ -492,7 +501,7 @@ impl PreparedPair<'_> {
         Ok(q)
     }
     pub fn marginal_price(&self, amount: U256) -> Result<Fraction> {
-        let q = self.curve.quote(amount, false)?;
+        let q = self.curve.quote(amount, 0)?;
         self.model
             .check_inventory(&self.curve, amount, q.amount_out, true)?;
         self.curve.marginal(amount)
