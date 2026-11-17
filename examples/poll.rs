@@ -1,29 +1,35 @@
-use state_poll_sdk::{Config, StatePollSdk, U256};
+//! Follow the pool and print one quote per update.
+//!
+//!     MONAD_RPC=https://rpc.monad.xyz TOKEN_IN=0x... TOKEN_OUT=0x... AMOUNT_IN=100000000 \
+//!         cargo run --example poll
+use thogamm_poll::{Poller, U256};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sell = std::env::var("TOKEN_IN")?.parse()?;
-    let buy = std::env::var("TOKEN_OUT")?.parse()?;
-    let amount: U256 = std::env::var("AMOUNT_IN")?.parse()?;
-    let gas_price: U256 = std::env::var("EFFECTIVE_GAS_PRICE_WEI")?.parse()?;
-    let mut sdk = StatePollSdk::connect(
-        std::env::var("THOGAMM_HTTP_RPC")?,
-        std::env::var("THOGAMM_PROXY")?.parse()?,
-        Config::default(),
-    )
-    .await?;
+    let pool_address = "0x80c74517BCC2D67fFE02D3ED886796272F647210".parse()?;
+    let token_in = std::env::var("TOKEN_IN")?.parse()?;
+    let token_out = std::env::var("TOKEN_OUT")?.parse()?;
+    let amount_in: U256 = std::env::var("AMOUNT_IN")?.parse()?;
+    let mut poller = Poller::connect(std::env::var("MONAD_RPC")?, pool_address).await?;
 
     loop {
-        let model = sdk.model();
-        match model.quote_execution_exact_input(sell, buy, amount, gas_price) {
+        let pool = poller.pool();
+        let block = pool.snapshot().block.number;
+        // A pair that cannot trade right now is an ordinary answer, not a failure.
+        match pool
+            .pair(token_in, token_out)
+            .and_then(|pair| pair.maker_quote_exact_input(amount_in))
+        {
             Ok(quote) => println!(
-                "block={} amount_out={} last_posted_block={}",
-                model.state().block.number,
-                quote.amount_out,
-                quote.last_posted_block
+                "block {block}: {} out, prices from block {}",
+                quote.amount_out, quote.price_block
             ),
-            Err(error) => eprintln!("block={} unavailable={error}", model.state().block.number),
+            Err(error) => println!("block {block}: {error}"),
         }
-        sdk.next_update().await?;
+        // A failed read keeps the last state. Its prices keep aging, so stop
+        // quoting from it once it is too old for your purposes.
+        if let Err(error) = poller.next_update().await {
+            eprintln!("read failed: {error}");
+        }
     }
 }
