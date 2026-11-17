@@ -8,7 +8,8 @@ try thousands of amounts without a network call.
 - Network: Monad mainnet, chain ID 143
 - Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`
 - Supports implementation `0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`
-- Rust 1.88 or later
+- Rust 1.88 or later. Before Rust 1.90, your project also needs Cargo's
+  `resolver = "3"`, which the 2024 edition uses by default
 
 New to ThogAMM? Read the
 [integration guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md)
