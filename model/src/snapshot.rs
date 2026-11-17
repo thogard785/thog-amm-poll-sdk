@@ -27,7 +27,7 @@ pub struct Block {
 /// An xStock contract keeps balances in shares and converts them to token
 /// amounts with a multiplier scaled by 1e18. The pool prices with the
 /// multiplier it has stored, which is not always the issuer's current one.
-/// <https://docs.xstocks.fi>
+/// <https://docs.xstocks.fi/developers/multipliers>
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct XStock {
     /// `sharesOf(pool)` on the token contract.

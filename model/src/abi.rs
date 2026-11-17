@@ -19,7 +19,7 @@ sol! {
         uint256 minAmountOut, uint256 expiry, uint256 extraFeePpm, address feeRecipient)
         external returns (uint256 amountOut);
 
-    // ---- ERC-7815 (https://eips.ethereum.org/EIPS/eip-7815) ---------------
+    // ---- ERC-7815 (https://github.com/ethereum/ERCs/blob/70e96af4539a39ed2bf564ec3559fb45159ff223/ERCS/erc-7815.md) ---------------
 
     #[derive(Debug, PartialEq, Eq)]
     struct Fraction { uint256 numerator; uint256 denominator; }

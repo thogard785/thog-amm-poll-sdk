@@ -1,136 +1,152 @@
 # ThogAMM polling SDK
 
-Read a complete ThogAMM snapshot, then quote any number of trade sizes locally.
-Version **0.6.1** supports **schema 8 / wire 8 / model 3** with pool-stored
-xStock multipliers and the expanded 17-token registry. The nine unwrapped
-xStocks are SPYx, QQQx, EWYx, NVDAx, TSLAx, SMHx, SPCXx, MUx and SKHYx, all
-with 18 decimals. [Token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
+Quote [ThogAMM](https://github.com/thogard785/thog-amm-integration-guide) in
+your own process. The SDK reads the pool's state over HTTP and reproduces the
+contract's arithmetic in memory, to the last raw unit, so a route search can
+try thousands of amounts without a network call.
 
-Quote calculations are synchronous and make no network calls. The polling SDK
-reads each multiplier from the pool's `storedMultiplier(token)`; the event
-SDK applies `MakerMultiplierUpdated` after its initial snapshot. Issuer changes
-alone do not change the model's stored values.
+- Network: Monad mainnet, chain ID 143
+- Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`
+- Supports implementation `0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`
+- Rust 1.88 or later
 
-- Monad mainnet, chain ID **143**.
-- Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`.
-- Rust **1.88+**, Cargo resolver **3**, Tokio. Commit your application's lockfile.
+New to ThogAMM? Read the
+[integration guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md)
+first. To follow the pool from a WebSocket subscription instead of polling, use
+the [event SDK](https://github.com/thogard785/thog-amm-event-sdk).
 
-Use this release with implementation
-`0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`. SDK 0.5.0 uses issuer
-multipliers and is incompatible; 0.6.0 already supports stored multipliers.
-The state format remains 8/8/3, so verify implementation compatibility after
-an upgrade and load a fresh snapshot.
-
-## Install and quote
+## Use it
 
 ```toml
 [dependencies]
-state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.6.1" }
+thogamm-poll = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.7.0" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust
-use state_poll_sdk::{Address, Config, Result, StatePollSdk, U256};
+use thogamm_poll::{Poller, TxContext, U256};
 
-async fn quote(
-    rpc: &str, pool: Address, token_in: Address, token_out: Address,
-    amount_in: U256, effective_gas_price: U256,
-) -> Result<U256> {
-    let sdk = StatePollSdk::connect(rpc, pool, Config::default()).await?;
-    Ok(sdk.model().quote_execution_exact_input(
-        token_in, token_out, amount_in, effective_gas_price,
-    )?.amount_out)
-}
+let mut poller = Poller::connect(rpc_url, pool_address).await?;
+
+// Price the swap in the block it should land in.
+let read = poller.pool();
+let pool = read.at_block(read.block_number() + 1, read.base_fee())?;
+
+let pair = pool.pair(usdc, weth)?;
+let quote = pair.maker_quote_exact_input(amount_in)?;          // makerQuoteExactInput
+let swap = pair.maker_swap_exact_input(amount_in, tx)?;        // makerSwapExactInput
+let with_fee = pair.swap_with_extra_fees(amount_in, 1_000, tx)?; // swapWithExtraFees, 0.10%
+
+poller.refresh().await?; // read the pool again: one request
 ```
 
-Keep the client for subsequent quotes. `refresh()` updates it immediately;
-`next_update()` waits for the configured interval (500 ms by default), then
-refreshes once. Each update reads a header, `getPoolData(0, 28)`, and one batch of
-`sharesOf(pool)` calls on each listed xStock plus `storedMultiplier(token)` calls
-on the pool. All calls are pinned to the same block hash: **three HTTP requests** with the current list.
-
-Quote methods are synchronous and perform no network calls. A failed refresh
-returns an error and retains the previous snapshot. Check
-`model.state().block.number` and `.hash` for provenance; `.tokens` supplies the
-active registry. New listings and index changes are discovered on refresh.
-Share accounting recognizes the contract's [nine compiled xStock addresses](model/src/shares.rs).
-Listing another of those nine needs no model change; extending the contract's
-xStock catalog requires a matching SDK release.
-
-## Quote methods
-
-| Method on `PoolModel` | Matches |
-| --- | --- |
-| `quote_exact_input(in, out, amount)` | Read-only `makerQuoteExactInput`, including 90% quote caps |
-| `quote_execution_exact_input(in, out, amount, gas_price)` | `makerSwapExactInput`, including friction and full settlement caps |
-| `quote_exact_output(in, out, target, gas_price)` | Required input for ERC-7815 Buy |
-| `limits(in, out)` | Directional upper bounds; smaller sizes may still reject |
-| `marginal_price(in, out, amount)` | Fraction of raw output units per raw input unit |
-
-Amounts are `U256` raw units. Execution methods assume an ordinary external
-caller/recipient and no extra fee. Their defaults use a cold AuctionHandler;
-`quote_execution_exact_input_with_context` and `quote_exact_output_with_context`
-accept `auction_handler_warm` as the final argument. Pass the transaction's
-**effective** gas price, not its maximum fee cap. The model reproduces the
-contract's share floors, dust and the distinct direct/Buy friction rounding.
-
-Execution output also depends on the block base fee and whether prices were
-updated in the execution block. For EIP-1559, effective gas price is
-`min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`. The SDK includes these
-adjustments and price-age widening; see the
-[exact rules](https://github.com/thogard785/thog-amm-integration-guide/blob/main/REFERENCE.md#exact-output-marginal-prices-and-settlement).
-Simulate the full settlement route with its actual fee and account-warmth context.
-
-`Quote.amount_in` is the amount passed to Thog. For execution quotes,
-`amount_out` is guaranteed recipient credit at the quoted state/context:
-compare `received >= amount_out`, not equality. For Buy it equals the target;
-actual xStock credit may be higher. Read-only quotes omit execution friction.
-If your router first pulls funds, quote/pass its measured newly received input,
-not the requested transfer or its total balance. See the [funding rules](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#funding-through-an-aggregator).
-
-For an amount ladder, call `model.prepare(in, out)?` once and use the same methods
-on the returned pair, omitting token arguments. Clone models to share immutable
-state. Rebuild prepared pairs after updates. Independent quotes do not simulate
-successive fills. `at_block(number, base_fee)` changes age and execution context; it holds
-inventory, policy and stored multipliers fixed.
-
-## Custom transport or offline state
-
-Implement `ChainReader::header` and `::calls`, then use `with_reader` or
-`snapshot(reader, pool, CallBlock)`. The built-in transport accepts latest,
-finalized, number or hash selectors and resolves all state reads to a hash.
-
-For externally fetched data, use `pool_data_params(pool, block)` and
-`decode_pool_data(pool, &bytes, block, share_balances)`. Supply an address-keyed
-`model::ShareBalances` map containing each listed xStock's physical `shares` and
-pool-stored `multiplier` from `storedMultiplier(token)` at that same block.
-Decoding checks the share valuation
-against the pool's physical balances. Keep the state call's `gasPrice: 0x1`:
-it preserves Monad's block base fee. The multiplier return is one ABI word (`uint256`).
-
-## Transactions and examples
-
-Encode `model::abi::makerSwapExactInputCall` with `alloy_sol_types::SolCall`:
-`tokenIn`, `tokenOut`, `amountIn`, `minAmountOut`, `recipient`, `deadlineBlock`.
-Approve the pool for input and send zero native value. Your router handles
-simulation, signing and submission. See the [settlement guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#quotes-limits-and-settlement).
-
-[examples/poll.rs](examples/poll.rs) uses `THOGAMM_HTTP_RPC`, `THOGAMM_PROXY`,
-`TOKEN_IN`, `TOKEN_OUT`, `AMOUNT_IN` and `EFFECTIVE_GAS_PRICE_WEI`:
+[examples/quote.rs](examples/quote.rs) is this as a complete program, and
+[examples/poll.rs](examples/poll.rs) follows the pool in a loop:
 
 ```sh
-cargo run --locked --example poll
+MONAD_RPC=https://rpc.monad.xyz cargo run --example quote
 ```
 
-[examples/offline.rs](examples/offline.rs) takes `POOL_DATA_FILE` (raw return hex),
-`SHARE_STATE_FILE` (JSON `ShareBalances`), comma-separated `AMOUNTS_IN` and the same
-pool/token/gas variables. Optional `BLOCK_NUMBER` checks the saved block.
+## What you get
 
-## Verification
+A `Pool` is the pool at one block. `pool.pair(token_in, token_out)` prepares
+one direction; its methods have the names of the contract calls they reproduce
+and return the same numbers.
 
-Run `cargo test --workspace --locked`. Tests compare all 272 directed pairs
-in the deployed 17-token registry against block-pinned contract results, and
-check polling of all nine stored multipliers. They also retain the historical
-quote, settlement and event-replay corpus.
-[Fixtures and reproduction instructions](https://github.com/thogard785/thog-amm-integration-guide#verification).
-The [event SDK](https://github.com/thogard785/thog-amm-event-sdk) shares this model.
-Both SDKs are [MIT licensed](LICENSE).
+| Contract call | Method on the pair | Returns |
+| --- | --- | --- |
+| `makerQuoteExactInput` | `maker_quote_exact_input(amount_in)` | `Quote { amount_out, price_block }` |
+| `makerSwapExactInput` | `maker_swap_exact_input(amount_in, tx)` | `Swap` |
+| `swapWithExtraFees` | `swap_with_extra_fees(amount_in, extra_fee_ppm, tx)` | `Swap` |
+| ERC-7815 `swap`, sell side | `swap_sell(amount_in, tx)` | `Swap` |
+| ERC-7815 `swap`, buy side | `swap_buy(amount_out, tx)` | `Swap` |
+| ERC-7815 `price` | `price(amount_in)` | `Fraction` |
+| ERC-7815 `getLimits` | `get_limits()` | `Limits { sell, buy }` |
+
+A `Swap` holds `amount_in`, `amount_out` (what the call returns), `fee` (the
+integrator fee) and `surcharge` (the execution surcharge that was applied).
+`tx` is a `TxContext`: the transaction's effective gas price, which decides the
+surcharge.
+
+A call the contract would revert returns `Error::Rejected` with the reason,
+for example `Rejection::StalePrices` or `Rejection::InventoryLimit`.
+
+Three things to get right:
+
+- **Quote at the block you will trade in.** Prices age every block.
+  `pool.at_block(number, base_fee)` evaluates the state you read at a later
+  block; quotes fail there once the prices have expired
+  (`pool.prices_valid_through()`).
+- **`extra_fee_ppm` is parts per million.** 100 is one basis point; 10,000 is
+  1%. Using a fee needs a fee recipient set up with us first; see the
+  [guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#swap-with-an-integrator-fee).
+- **Quote a route's swaps in sequence.** `pool.after(&swap)` is the pool as
+  that swap leaves it. Quoting two swaps against the same pool ignores the
+  first one's effect on the second.
+
+## Keeping it current
+
+`poller.refresh()` reads the pool again with one `eth_call` and returns whether
+anything changed. `poller.next_update()` waits the polling interval (500 ms
+unless changed with `set_interval`) and then refreshes.
+
+A failed refresh returns the error and keeps the state from the last
+successful read. That state keeps aging: `pool.snapshot().block.number` says
+which block it is from.
+
+## Your own RPC client
+
+Implement `EthCall`, one method, to read through the client you already have:
+
+```rust
+impl thogamm_poll::EthCall for MyClient {
+    async fn eth_call(&self, to: Address, data: Bytes, block: BlockId) -> thogamm::Result<Bytes> {
+        // Send with gasPrice set, or a Monad node reports a zero base fee.
+        self.call(to, data, block).await
+    }
+}
+let poller = Poller::with_rpc(my_client, pool_address).await?;
+```
+
+Or leave the network out entirely: `thogamm::rpc::snapshot_call(pool, tokens)`
+gives the call to make and `decode_snapshot` turns its output into a
+`Snapshot` for `Pool::new`.
+
+## Layout
+
+| Path | Contents |
+| --- | --- |
+| `src/lib.rs` | `Poller` |
+| `model/` | The `thogamm` crate: state, arithmetic and events, with no polling. The event SDK uses it too. |
+| `model/src/layout.rs` | Where each value sits in the pool's storage |
+| `model/src/snapshot.rs` | The state read at one block |
+| `model/src/pool.rs`, `curve.rs` | Decoding and pricing |
+| `model/src/events.rs` | Advancing a snapshot by one block of logs |
+| `model/src/rpc.rs` | Reading a snapshot in one call |
+
+The [reference](https://github.com/thogard785/thog-amm-integration-guide/blob/main/REFERENCE.md)
+specifies what this code implements, section for file.
+
+## Tests
+
+```sh
+cargo test --workspace --release
+```
+
+The tests replay 61,920 calls recorded from the contract (quotes, marginal
+prices, limits, swaps at every surcharge tier, exact-output swaps) and require
+the same integers, and a rejection wherever the contract reverted. They also
+replay 250 recorded blocks of logs and compare the result with the state read
+from the chain at each block.
+
+Three more tests compare against the deployed pool and need an endpoint:
+
+```sh
+MONAD_RPC=https://rpc.monad.xyz cargo test --release -p thogamm --test live -- --ignored --nocapture
+```
+
+They check every pair's quote, price and limits at one block, simulate swaps
+and fee swaps at each surcharge tier, and check how a transaction's fee fields
+set the surcharge.
+
+[MIT license](LICENSE).
