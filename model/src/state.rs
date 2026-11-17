@@ -237,16 +237,8 @@ impl PoolState {
         }
         Ok(balances)
     }
-    pub fn update_multipliers(&mut self, multipliers: &crate::shares::Multipliers) -> Result<()> {
-        if multipliers.len() != self.share_balances.len() {
-            return Err(Error::InvalidData("incomplete xStock multipliers".into()));
-        }
-        for (token, balance) in &mut self.share_balances {
-            balance.multiplier = *multipliers
-                .get(token)
-                .filter(|m| !m.is_zero())
-                .ok_or_else(|| Error::InvalidData("missing xStock multiplier".into()))?;
-        }
+    /// Revalue physical shares using the executor's stored multiplier values.
+    pub fn refresh_share_balances(&mut self) -> Result<()> {
         for i in 0..self.tokens.len() {
             if self.share_balances.contains_key(&self.tokens[i].token) {
                 self.balances[i] = self.amount_for_units(i, self.physical_units(i))?;

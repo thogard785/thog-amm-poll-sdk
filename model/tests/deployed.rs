@@ -105,17 +105,7 @@ fn replay_two_hundred_deployed_blocks_matches_every_snapshot() {
         let logs: Vec<thogamm_model::RpcLog> = serde_json::from_value(b["logs"].clone()).unwrap();
         count += logs.len();
         let h = serde_json::from_value(b["header"].clone()).unwrap();
-        state = thogamm_model::events::apply_owned_block(
-            state,
-            h,
-            &logs,
-            &serde_json::from_value::<thogamm_model::ShareBalances>(b["shareBalances"].clone())
-                .unwrap()
-                .into_iter()
-                .map(|(a, b)| (a, b.multiplier))
-                .collect(),
-        )
-        .unwrap();
+        state = thogamm_model::events::apply_owned_block(state, h, &logs).unwrap();
         let expected = decode(b).into_state();
         assert_eq!(state.block, expected.block);
         assert_eq!(

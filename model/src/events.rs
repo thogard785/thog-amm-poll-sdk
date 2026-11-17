@@ -172,13 +172,8 @@ fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<(
 }
 /// Returns a new image only after every log was checked. Never double-count swap events
 /// alongside Transfer: maker/taker events are inventory checkpoints, not balance deltas.
-pub fn apply_block(
-    previous: &PoolState,
-    block: BlockHeader,
-    logs: &[RpcLog],
-    multipliers: &crate::Multipliers,
-) -> Result<PoolState> {
-    apply_owned_block(previous.clone(), block, logs, multipliers)
+pub fn apply_block(previous: &PoolState, block: BlockHeader, logs: &[RpcLog]) -> Result<PoolState> {
+    apply_owned_block(previous.clone(), block, logs)
 }
 /// Apply a complete block to an owned, unpublished candidate. Ownership avoids
 /// copying the image at each block of a finalized ancestry; failure discards the
@@ -187,7 +182,6 @@ pub fn apply_owned_block<'a>(
     mut next: PoolState,
     block: BlockHeader,
     logs: impl IntoIterator<Item = &'a RpcLog>,
-    multipliers: &crate::Multipliers,
 ) -> Result<PoolState> {
     if block.number != next.block.number.checked_add(1).ok_or(Error::Arithmetic)?
         || Some(block.parent_hash) != next.block.hash
@@ -238,6 +232,19 @@ pub fn apply_owned_block<'a>(
                     U256::from(e.offset as u64),
                 )?;
                 next.set_bits(7, 160, 32, U256::from(e.sequence))?;
+            } else if *topic == abi::MakerMultiplierUpdated::SIGNATURE_HASH {
+                let e = decode::<abi::MakerMultiplierUpdated>(log)?;
+                if !crate::shares::is_xstock(e.token)
+                    || e.multiplier.is_zero()
+                    || e.multiplier > mask(128)
+                {
+                    return Err(invalid());
+                }
+                // Anyone may sync a compiled but unlisted stock. It does not
+                // affect the active registry; listing still requires a snapshot.
+                if let Some(holding) = next.share_balances.get_mut(&e.token) {
+                    holding.multiplier = e.multiplier;
+                }
             } else if *topic == abi::MakerInventoryUpdated::SIGNATURE_HASH {
                 let e = decode::<abi::MakerInventoryUpdated>(log)?;
                 let i = usize::from(e.index);
@@ -307,7 +314,7 @@ pub fn apply_owned_block<'a>(
             }
         }
     }
-    next.update_multipliers(multipliers)?;
+    next.refresh_share_balances()?;
     next.block = block.into();
     next.validate()?;
     Ok(next)

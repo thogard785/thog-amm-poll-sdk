@@ -12,7 +12,7 @@ use tokio::{
 };
 
 #[tokio::test]
-async fn snapshot_pins_pool_and_issuer_batches_to_one_hash() {
+async fn snapshot_pins_shares_and_executor_multipliers_to_one_hash() {
     let f = support::fixture();
     let p = support::page(&f.samples[0].snapshot);
     let number = p.blockNumber.to::<u64>();
@@ -51,10 +51,9 @@ async fn snapshot_pins_pool_and_issuer_batches_to_one_hash() {
                             assert_eq!(abi::sharesOfCall::abi_decode_validate(&data).unwrap().holder, proxy);
                             abi::sharesOfCall::abi_encode_returns(&shares[&to].shares)
                         } else {
-                            assert_eq!(data.as_ref(), abi::getCurrentMultiplierCall {}.abi_encode());
-                            abi::getCurrentMultiplierCall::abi_encode_returns(&abi::getCurrentMultiplierReturn {
-                                multiplier:shares[&to].multiplier, activation:thogamm_model::U256::ZERO, period:thogamm_model::U256::ZERO
-                            })
+                            assert_eq!(to, proxy, "stored multipliers must be read from the executor");
+                            let token = abi::storedMultiplierCall::abi_decode_validate(&data).unwrap().token;
+                            abi::storedMultiplierCall::abi_encode_returns(&shares[&token].multiplier)
                         };
                         responses.push(json!({"jsonrpc":"2.0","id":call["id"],"result":thogamm_model::Bytes::from(result)}));
                     }

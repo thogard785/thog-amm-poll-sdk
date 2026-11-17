@@ -70,7 +70,8 @@ sol! {
     event MakerTokenAdded(uint8 indexed tokenIndex, address indexed token, TokenMetadata metadata, CategoryMetadata categoryMetadata, uint256 balance);
     event MakerTokenRetired(uint8 indexed retiredIndex, address indexed token, uint8 movedFrom, uint32 generation);
     function sharesOf(address holder) external view returns (uint256 shares);
-    function getCurrentMultiplier() external view returns (uint256 multiplier, uint256 activation, uint256 period);
+    function storedMultiplier(address token) external view returns (uint256 multiplier);
+    event MakerMultiplierUpdated(address indexed token, uint256 multiplier);
     event MakerInventoryUpdated(uint8 indexed index, address indexed token, uint128 balance);
     event TransferShares(address indexed from, address indexed to, uint256 value);
     event MakerWmonBalanceCheckpoint(uint256 balance);

@@ -76,7 +76,7 @@ impl PoolModel {
         &self.state
     }
     /// Advance price age and execution fee/freshness context without predicting
-    /// intervening publications, trades, inventory or issuer changes.
+    /// intervening publications, trades, inventory or stored-multiplier changes.
     pub fn at_block(&self, number: u64, base_fee_per_gas: U256) -> Result<Self> {
         if number < self.state.block.number {
             return Err(Error::InvalidData(

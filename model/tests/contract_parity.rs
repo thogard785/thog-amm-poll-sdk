@@ -81,22 +81,10 @@ fn duplicate_removed_or_out_of_order_logs_never_partially_mutate_state() {
     let mut logs = support::logs(e, f.baseFee);
     let original = before.state().clone();
     logs.push(logs[0].clone());
-    assert!(events::apply_block(
-        &original,
-        support::model_header(&after),
-        &logs,
-        &support::multipliers_for(&after)
-    )
-    .is_err());
+    assert!(events::apply_block(&original, support::model_header(&after), &logs,).is_err());
     logs.pop();
     logs[0].removed = true;
-    assert!(events::apply_block(
-        &original,
-        support::model_header(&after),
-        &logs,
-        &support::multipliers_for(&after)
-    )
-    .is_err());
+    assert!(events::apply_block(&original, support::model_header(&after), &logs,).is_err());
     assert_eq!(before.state(), &original);
 }
 
@@ -122,7 +110,6 @@ fn deployed_publications_preserve_spare_bits_and_replay_caps_and_readiness() {
             before.state(),
             support::model_header(&after),
             &support::logs(e, f.baseFee),
-            &support::multipliers_for(&after),
         )
         .unwrap();
         assert_eq!(&actual, after.state(), "stage {i}");

@@ -1,9 +1,15 @@
 # ThogAMM polling SDK
 
 Read a complete ThogAMM snapshot, then quote any number of trade sizes locally.
-Version **0.5.0** supports **schema 8 / wire 8 / model 3** and the current 13-token
-registry, including **SPYx, QQQx, EWYx, NVDAx and TSLAx**. These are unwrapped
-xStocks with 18 decimals. Addresses are in the [integration guide](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
+Version **0.6.0** supports **schema 8 / wire 8 / model 3** with executor-stored
+xStock multipliers and the expanded 17-token registry. The nine unwrapped
+xStocks are SPYx, QQQx, EWYx, NVDAx, TSLAx, SMHx, SPCXx, MUx and SKHYx, all
+with 18 decimals. [Token addresses](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#listed-tokens).
+
+Quote calculations are synchronous and make no network calls. The polling SDK
+reads each multiplier from the executor's `storedMultiplier(token)`; the event
+SDK applies `MakerMultiplierUpdated` after its initial snapshot. Issuer changes
+alone do not change the model's stored values.
 
 - Monad mainnet, chain ID **143**.
 - Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`.
@@ -11,9 +17,11 @@ xStocks with 18 decimals. Addresses are in the [integration guide](https://githu
 
 Model 3 was activated at Monad block **117177785** in
 [the proxy upgrade transaction](https://monadscan.com/tx/0x962e87a568d98fba303d7077f6b51242599c07446799b87f117cbd14065214d2).
-Use **v0.5.0** for model 3; v0.4.1 is retained for historical model-2 snapshots.
-The SDK rejects mismatched model identities. Verify the selected snapshot's
-identity and commit your application's `Cargo.lock`.
+Use **v0.6.0** with the stored-multiplier implementation. v0.5.0 reads issuer
+multipliers and is for the previous implementation. Schema/wire/model numbers
+remain 8/8/3, so those numbers alone do not distinguish the implementations.
+Verify the implementation address in the integration guide, reconnect after
+upgrades, and commit your application's `Cargo.lock`.
 
 The coordinated upgrade pauses both maker liquidity and taker execution while
 the shared operator backend is stopped, upgraded and restarted. The operator
@@ -26,7 +34,7 @@ and obtain a complete snapshot after the upgrade. See
 
 ```toml
 [dependencies]
-state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.5.0" }
+state-poll-sdk = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.6.0" }
 ```
 
 ```rust
@@ -46,7 +54,8 @@ async fn quote(
 Keep the client for subsequent quotes. `refresh()` updates it immediately;
 `next_update()` waits for the configured interval (500 ms by default), then
 refreshes once. Each update reads a header, `getPoolData(0, 28)`, and one batch of
-`sharesOf(pool)` plus `getCurrentMultiplier()` calls for listed xStocks. All calls
+`sharesOf(pool)` calls on each listed xStock plus `storedMultiplier(token)` calls
+on the executor. All calls
 are pinned to the same block hash: **three HTTP requests** with the current list.
 
 Quote methods are synchronous and perform no network calls. A failed refresh
@@ -116,7 +125,7 @@ For an amount ladder, call `model.prepare(in, out)?` once and use the same metho
 on the returned pair, omitting token arguments. Clone models to share immutable
 state. Rebuild prepared pairs after updates. Independent quotes do not simulate
 successive fills. `at_block(number, base_fee)` changes age and execution context; it holds
-inventory, policy and issuer multipliers fixed.
+inventory, policy and stored multipliers fixed.
 
 ## Custom transport or offline state
 

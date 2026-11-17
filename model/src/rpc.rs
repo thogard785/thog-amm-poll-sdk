@@ -1,7 +1,7 @@
-//! Hash-pinned pool and issuer state. Quotes perform no network calls.
+//! Hash-pinned pool, physical shares and executor-stored multipliers. Quotes perform no network calls.
 use crate::{
-    abi, shares::is_xstock, Address, BlockHeader, Bytes, Error, Multipliers, PoolModel, Result,
-    ShareBalance, ShareBalances, B256,
+    abi, shares::is_xstock, Address, BlockHeader, Bytes, Error, PoolModel, Result, ShareBalance,
+    ShareBalances, B256,
 };
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
@@ -171,7 +171,7 @@ pub fn pool_data_calldata() -> Bytes {
 pub fn pool_data_params(proxy: Address, block: CallBlock) -> Value {
     state_call_params(proxy, pool_data_calldata(), block)
 }
-/// Decode a complete pool image and issuer share state read at the same block.
+/// Decode a complete pool image, physical shares and stored multipliers read at the same block.
 /// The caller owns provenance for externally supplied reads.
 pub fn decode_pool_data(
     proxy: Address,
@@ -199,36 +199,7 @@ pub fn decode_pool_data(
     };
     PoolModel::from_snapshot(proxy, page, hash, shares)
 }
-/// Read current issuer multipliers at a known block, including activations without logs.
-pub async fn read_multipliers<R: ChainReader>(
-    rpc: &R,
-    tokens: &[Address],
-    hash: B256,
-) -> Result<Multipliers> {
-    let tokens: Vec<_> = tokens.iter().copied().filter(|t| is_xstock(*t)).collect();
-    let calls = tokens
-        .iter()
-        .map(|t| (*t, abi::getCurrentMultiplierCall {}.abi_encode().into()))
-        .collect();
-    let results = rpc.calls(calls, CallBlock::Hash(hash)).await?;
-    if results.len() != tokens.len() {
-        return Err(Error::Rpc("incomplete issuer batch".into()));
-    }
-    tokens
-        .into_iter()
-        .zip(results)
-        .map(|(token, data)| {
-            let m = abi::getCurrentMultiplierCall::abi_decode_returns_validate(&data)
-                .map_err(|e| Error::Abi(e.to_string()))?
-                .multiplier;
-            if m.is_zero() {
-                return Err(Error::InvalidData("zero xStock multiplier".into()));
-            }
-            Ok((token, m))
-        })
-        .collect()
-}
-/// Header, pool image, then one issuer batch, all eth_calls pinned to the header hash.
+/// Header, pool image, then physical shares and stored multipliers, pinned to one hash.
 pub async fn snapshot<R: ChainReader>(
     rpc: &R,
     proxy: Address,
@@ -258,11 +229,16 @@ pub async fn snapshot<R: ChainReader>(
             *token,
             abi::sharesOfCall { holder: proxy }.abi_encode().into(),
         ));
-        calls.push((*token, abi::getCurrentMultiplierCall {}.abi_encode().into()));
+        calls.push((
+            proxy,
+            abi::storedMultiplierCall { token: *token }
+                .abi_encode()
+                .into(),
+        ));
     }
     let results = rpc.calls(calls, pinned).await?;
     if results.len() != 2 * tokens.len() {
-        return Err(Error::Rpc("incomplete issuer batch".into()));
+        return Err(Error::Rpc("incomplete share/multiplier batch".into()));
     }
     let mut shares = ShareBalances::new();
     for (token, pair) in tokens.into_iter().zip(results.chunks_exact(2)) {
@@ -271,9 +247,8 @@ pub async fn snapshot<R: ChainReader>(
             ShareBalance {
                 shares: abi::sharesOfCall::abi_decode_returns_validate(&pair[0])
                     .map_err(|e| Error::Abi(e.to_string()))?,
-                multiplier: abi::getCurrentMultiplierCall::abi_decode_returns_validate(&pair[1])
-                    .map_err(|e| Error::Abi(e.to_string()))?
-                    .multiplier,
+                multiplier: abi::storedMultiplierCall::abi_decode_returns_validate(&pair[1])
+                    .map_err(|e| Error::Abi(e.to_string()))?,
             },
         );
     }

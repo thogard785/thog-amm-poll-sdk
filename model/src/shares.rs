@@ -9,7 +9,6 @@ pub struct ShareBalance {
     pub multiplier: U256,
 }
 pub type ShareBalances = BTreeMap<Address, ShareBalance>;
-pub type Multipliers = BTreeMap<Address, U256>;
 
 /// Recognizes the deployed contract's nine compiled unwrapped xStock addresses.
 /// Active listings are discovered separately from pool state. Extending the
