@@ -89,6 +89,9 @@ pub struct PoolState {
     pub share_balances: crate::shares::ShareBalances,
     pub native_balance: U256,
     pub categories: Vec<CategoryMetadata>,
+    /// Raw page words. Event replay maintains all quote inputs; operational
+    /// Perpl fields at slots 122..127 retain their values from the last snapshot.
+    /// Perpetual exposure changes reach quotes through MakerLendingExposureUpdated.
     pub words: BTreeMap<u16, U256>,
 }
 

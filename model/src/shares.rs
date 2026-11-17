@@ -1,11 +1,14 @@
-//! Issuer share state for the deployed contract's rebasing-token catalog.
+//! Physical shares and pool-stored multipliers for the deployed xStock catalog.
 use crate::{Address, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareBalance {
+    /// Physical shares returned by the token's `sharesOf(pool)` at the snapshot block.
     pub shares: U256,
+    /// One uint256 returned by the pool's `storedMultiplier(token)` at that block.
+    /// Do not substitute the issuer's current multiplier: it can differ until synced.
     pub multiplier: U256,
 }
 pub type ShareBalances = BTreeMap<Address, ShareBalance>;
