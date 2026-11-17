@@ -284,10 +284,10 @@ async fn swaps_match_the_deployed_pool_at_every_fee_and_gas_price() {
     assert!(accepted > 0);
 }
 
-/// How a transaction's fee fields reach the surcharge, and what does not.
+/// How a transaction's fee fields and access list reach the surcharge.
 #[tokio::test]
 #[ignore = "needs MONAD_RPC"]
-async fn fee_fields_set_the_surcharge_and_an_access_list_does_not() {
+async fn fee_fields_and_the_access_list_set_the_surcharge() {
     let rpc = HttpRpc::new(std::env::var("MONAD_RPC").expect("set MONAD_RPC")).unwrap();
     let pool_address: Address = POOL.parse().unwrap();
     let pool = read_pool(&rpc).await;
@@ -328,39 +328,50 @@ async fn fee_fields_set_the_surcharge_and_an_access_list_does_not() {
     let handler = "0xD32EdF6642D917DbBE7B8BF8e5d6F5df6a9FFF58";
     let triple = base_fee * U256::from(3);
     let tip = base_fee * U256::from(6) / U256::from(10);
-    // (fee fields of the simulated transaction, the effective gas price they give)
-    for (name, fields, gas_price) in [
-        ("no fee fields", json!({}), U256::ZERO),
+    let access_list = json!([{ "address": handler, "storageKeys": [] }]);
+    // (fields of the simulated transaction, the effective gas price they
+    // give, whether they make the AuctionHandler warm)
+    for (name, fields, gas_price, warm) in [
+        ("no fee fields", json!({}), U256::ZERO, false),
         (
             "gasPrice at the base fee",
             json!({ "gasPrice": base_fee }),
             base_fee,
+            false,
         ),
         (
             "gasPrice at three times the base fee",
             json!({ "gasPrice": triple }),
             triple,
+            false,
         ),
         (
             "EIP-1559 without a tip",
             json!({ "maxFeePerGas": triple, "maxPriorityFeePerGas": U256::ZERO }),
             base_fee,
+            false,
         ),
         (
             "EIP-1559 with a 60% tip",
             json!({ "maxFeePerGas": triple, "maxPriorityFeePerGas": tip }),
             base_fee + tip,
+            false,
         ),
         (
             "EIP-1559 with a tip above the fee cap",
             json!({ "maxFeePerGas": triple, "maxPriorityFeePerGas": triple }),
             triple,
+            false,
         ),
-        // Naming the AuctionHandler in an access list does not make it warm.
+        // An access list that names the AuctionHandler makes it warm, and the
+        // swap pays the highest surcharge at any gas price. This case sets the
+        // EIP-1559 fields because a Monad node drops the access list of an
+        // `eth_call` that is priced with `gasPrice`.
         (
-            "AuctionHandler in the access list",
-            json!({ "gasPrice": base_fee, "accessList": [{ "address": handler, "storageKeys": [] }] }),
+            "EIP-1559 without a tip, AuctionHandler in the access list",
+            json!({ "maxFeePerGas": triple, "maxPriorityFeePerGas": U256::ZERO, "accessList": access_list }),
             base_fee,
+            true,
         ),
     ] {
         let mut tx = json!({ "from": caller, "to": pool_address, "data": swap_to(usdc) });
@@ -370,9 +381,11 @@ async fn fee_fields_set_the_surcharge_and_an_access_list_does_not() {
         let output = call(&rpc, json!([tx, block.to_json(), overrides]))
             .await
             .unwrap();
-        let here = pair
-            .maker_swap_exact_input(amount_in, TxContext::with_gas_price(gas_price))
-            .unwrap();
+        let context = TxContext {
+            gas_price,
+            auction_handler_warm: warm,
+        };
+        let here = pair.maker_swap_exact_input(amount_in, context).unwrap();
         assert_eq!(U256::from_be_slice(&output), here.amount_out, "{name}");
         println!("{name}: surcharge {} x 0.01 bp", here.surcharge);
     }

@@ -216,6 +216,61 @@ fn after_a_swap_the_pool_holds_what_the_swap_moved() {
 }
 
 #[test]
+fn a_swap_of_zero_changes_nothing_and_any_other_swap_settles() {
+    // One WETH sent straight to the pool: held, but not yet recorded.
+    let (deployed, usdc, weth, stock) = deployed_pool();
+    let index = |token| {
+        deployed
+            .tokens()
+            .iter()
+            .position(|t| t.address == token)
+            .unwrap()
+    };
+    let mut snapshot = deployed.snapshot().clone();
+    snapshot.balances[index(weth)] += u(1_000_000_000_000_000_000);
+    let pool = Pool::new(snapshot).unwrap();
+    let held = |pool: &Pool| pool.token(weth).unwrap().balance;
+    let recorded = |pool: &Pool| pool.token(weth).unwrap().recorded_balance;
+    assert_ne!(held(&pool), recorded(&pool));
+    let tx = cold(pool.base_fee());
+    let pair = pool.pair(usdc, weth).unwrap();
+
+    // The contract returns from an ERC-7815 swap of zero before settlement,
+    // so the pool still has not recorded the WETH it was sent.
+    for swap in [
+        pair.swap_sell(U256::ZERO, tx).unwrap(),
+        pair.swap_buy(U256::ZERO, tx).unwrap(),
+    ] {
+        assert_eq!((swap.amount_in, swap.amount_out), (U256::ZERO, U256::ZERO));
+        assert_eq!(pool.after(&swap).unwrap().snapshot(), pool.snapshot());
+    }
+
+    // A fee of 100% leaves the caller nothing, but that swap does settle: the
+    // fee leaves the pool, and the pool records what it now holds.
+    let swap = pair
+        .swap_with_extra_fees(u(100_000_000), 1_000_000, tx)
+        .unwrap();
+    assert_eq!(swap.amount_out, U256::ZERO);
+    let after = pool.after(&swap).unwrap();
+    assert_eq!(held(&after), held(&pool) - swap.fee);
+    assert_eq!(recorded(&after), held(&after));
+
+    // With nothing sent to the caller, an xStock output loses the fee's
+    // shares and no rounding allowance.
+    let shares = |pool: &Pool| pool.token(stock).unwrap().xstock.clone().unwrap();
+    let swap = pool
+        .pair(usdc, stock)
+        .unwrap()
+        .swap_with_extra_fees(u(50_000_000), 1_000_000, tx)
+        .unwrap();
+    let before = shares(&pool);
+    assert_eq!(
+        shares(&pool.after(&swap).unwrap()).shares,
+        before.shares - before.shares_for(swap.fee).unwrap()
+    );
+}
+
+#[test]
 fn rejections_say_why() {
     let (pool, usdc, weth, _) = deployed_pool();
     let reason = |result: thogamm::Result<_>| -> Rejection {

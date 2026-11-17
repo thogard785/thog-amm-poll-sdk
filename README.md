@@ -65,8 +65,10 @@ and return the same numbers.
 
 A `Swap` holds `amount_in`, `amount_out` (what the call returns), `fee` (the
 integrator fee) and `surcharge` (the execution surcharge that was applied).
-`tx` is a `TxContext`: the transaction's effective gas price, which decides the
-surcharge.
+`tx` is a `TxContext`: the transaction's effective gas price, and whether the
+FastLane AuctionHandler is warm when the pool is called. Together they decide
+the surcharge; the guide explains
+[both](https://github.com/thogard785/thog-amm-integration-guide/blob/main/THOGAMM_AGGREGATOR_INTEGRATION.md#execution-surcharge).
 
 A call the contract would revert returns `Error::Rejected` with the reason,
 for example `Rejection::StalePrices` or `Rejection::InventoryLimit`.
@@ -147,6 +149,6 @@ MONAD_RPC=https://rpc.monad.xyz cargo test --release -p thogamm --test live -- -
 
 They check every pair's quote, price and limits at one block, simulate swaps
 and fee swaps at each surcharge tier, and check how a transaction's fee fields
-set the surcharge.
+and access list set the surcharge.
 
 [MIT license](LICENSE).

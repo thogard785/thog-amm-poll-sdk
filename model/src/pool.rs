@@ -110,9 +110,12 @@ pub struct TxContext {
     /// Effective gas price in wei. For an EIP-1559 transaction this is
     /// `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`.
     pub gas_price: U256,
-    /// Whether the transaction has already touched the FastLane AuctionHandler
-    /// (`0xD32EdF6642D917DbBE7B8BF8e5d6F5df6a9FFF58`), in an earlier call or
-    /// through its access list.
+    /// Whether the FastLane AuctionHandler
+    /// (`0xD32EdF6642D917DbBE7B8BF8e5d6F5df6a9FFF58`) is already warm when the
+    /// pool is called: the transaction called it earlier, or names it in its
+    /// [access list](https://eips.ethereum.org/EIPS/eip-2930). A warm
+    /// AuctionHandler puts the swap in the highest surcharge tier, so leave it
+    /// out of your access list; `eth_createAccessList` includes it.
     pub auction_handler_warm: bool,
 }
 
@@ -149,6 +152,14 @@ pub struct Swap {
     pub surcharge: u32,
     /// Block of the price update the swap used.
     pub price_block: u64,
+    /// `None` for an ERC-7815 swap of zero, which returns before settlement.
+    settled: Option<Settled>,
+}
+
+/// What the pool holds of a swap's two tokens once the swap has settled, in
+/// the units the pool tracks: shares for an xStock, raw units otherwise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Settled {
     input: usize,
     output: usize,
     units_in: U256,
@@ -407,9 +418,18 @@ impl Pool {
 
     /// The pool as it will be once `swap` has settled, for quoting a later
     /// swap of the same route. `swap` must come from this pool.
+    ///
+    /// Settlement records what the pool holds of the swap's two tokens, which
+    /// also takes in anything sent to the pool since they were last recorded.
     pub fn after(&self, swap: &Swap) -> Result<Self> {
+        let Some(settled) = &swap.settled else {
+            return Ok(self.clone());
+        };
         let mut snapshot = (*self.snapshot).clone();
-        for (index, units) in [(swap.input, swap.units_in), (swap.output, swap.units_out)] {
+        for (index, units) in [
+            (settled.input, settled.units_in),
+            (settled.output, settled.units_out),
+        ] {
             let token = self.tokens.get(index).ok_or(Error::Arithmetic)?;
             snapshot.balances[index] = token.amount_of_units(units)?;
             if let Some(xstock) = &mut snapshot.xstocks[index] {
@@ -634,19 +654,16 @@ impl Pair<'_> {
         )
     }
 
-    /// The contract accepts an ERC-7815 swap of zero and moves nothing.
+    /// The contract accepts an ERC-7815 swap of zero and returns before
+    /// settlement: nothing moves, and the pool records nothing.
     fn nothing(&self, surcharge: u32) -> Swap {
-        let (tin, tout) = self.tokens();
         Swap {
             amount_in: U256::ZERO,
             amount_out: U256::ZERO,
             fee: U256::ZERO,
             surcharge,
             price_block: self.pool.price_block,
-            input: self.input,
-            output: self.output,
-            units_in: tin.units(),
-            units_out: tout.units(),
+            settled: None,
         }
     }
 
@@ -711,10 +728,12 @@ impl Pair<'_> {
             fee,
             surcharge,
             price_block: self.pool.price_block,
-            input: self.input,
-            output: self.output,
-            units_in,
-            units_out,
+            settled: Some(Settled {
+                input: self.input,
+                output: self.output,
+                units_in,
+                units_out,
+            }),
         })
     }
 
