@@ -1,78 +1,94 @@
-//! Read ThogAMM pool state once, then quote trade sizes locally in your aggregator.
-//! Refreshes pin pool and issuer reads to one block hash, including new listings.
+//! Keep a ThogAMM pool current by polling an HTTP RPC endpoint.
+//!
+//! ```no_run
+//! # async fn example() -> thogamm_poll::Result<()> {
+//! use thogamm_poll::{Poller, TxContext, U256};
+//!
+//! let pool_address = "0x80c74517BCC2D67fFE02D3ED886796272F647210".parse().unwrap();
+//! let usdc = "0x754704Bc059F8C67012fEd69BC8A327a5aafb603".parse().unwrap();
+//! let weth = "0xEE8c0E9f1BFFb4Eb878d8f15f368A02a35481242".parse().unwrap();
+//!
+//! let poller = Poller::connect("https://rpc.monad.xyz", pool_address).await?;
+//! let pair = poller.pool().pair(usdc, weth)?;
+//! let quote = pair.maker_quote_exact_input(U256::from(100_000_000u64))?;
+//! println!("100 USDC -> {} wei of WETH", quote.amount_out);
+//! # Ok(()) }
+//! ```
+//!
+//! Quoting is in the [`thogamm`] crate, re-exported here.
 use std::time::Duration;
-pub use thogamm_model::rpc::{
-    decode_pool_data, pool_data_calldata, pool_data_params, snapshot, CallBlock, ChainReader,
-    HttpRpc,
+pub use thogamm::{
+    self,
+    rpc::{BlockId, EthCall, HttpRpc},
+    Address, Error, Pair, Pool, Quote, Rejection, Result, Swap, TxContext, U256,
 };
-pub use thogamm_model::{self as model, Address, Error, PoolModel, Result, U256};
+use thogamm::{rpc::read_snapshot, Snapshot};
 
-#[derive(Clone, Debug)]
-pub struct Config {
-    /// Time between calls when using `next_update()`. `refresh()` does not wait.
-    pub poll_interval: Duration,
+/// Time between reads in [`Poller::next_update`]; a little over one Monad block.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A ThogAMM pool read from an RPC endpoint and re-read on demand.
+pub struct Poller<R = HttpRpc> {
+    rpc: R,
+    pool: Pool,
+    interval: Duration,
 }
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            poll_interval: Duration::from_millis(500),
-        }
+
+impl Poller<HttpRpc> {
+    /// Read the pool at `pool_address` through a Monad HTTP RPC endpoint.
+    pub async fn connect(http_url: impl Into<String>, pool_address: Address) -> Result<Self> {
+        Self::with_rpc(HttpRpc::new(http_url)?, pool_address).await
     }
 }
-/// A ThogAMM client with a locally cached pool snapshot for synchronous quotes.
-pub struct StatePollSdk<R = HttpRpc> {
-    reader: R,
-    model: PoolModel,
-    config: Config,
-}
-impl StatePollSdk<HttpRpc> {
-    /// Connect using a Monad HTTP RPC endpoint and the ThogAMM pool address.
-    /// Loads the initial pool and issuer state. Keep this client for later quotes.
-    pub async fn connect(
-        http_url: impl Into<String>,
-        proxy: Address,
-        config: Config,
-    ) -> Result<Self> {
-        Self::with_reader(HttpRpc::new(http_url)?, proxy, config).await
-    }
-}
-impl<R: ChainReader> StatePollSdk<R> {
-    /// Load initial state through your own RPC client.
-    pub async fn with_reader(reader: R, proxy: Address, config: Config) -> Result<Self> {
-        if config.poll_interval.is_zero() {
-            return Err(Error::InvalidData("poll interval must be positive".into()));
-        }
-        let model = snapshot(&reader, proxy, CallBlock::Latest).await?;
+
+impl<R: EthCall> Poller<R> {
+    /// As [`Poller::connect`], reading through your own RPC client.
+    pub async fn with_rpc(rpc: R, pool_address: Address) -> Result<Self> {
+        let snapshot = read_snapshot(&rpc, pool_address, BlockId::Latest, &[]).await?;
         Ok(Self {
-            reader,
-            model,
-            config,
+            rpc,
+            pool: Pool::new(snapshot)?,
+            interval: DEFAULT_INTERVAL,
         })
     }
-    /// The most recent pool snapshot. Quote methods perform no network calls.
-    pub fn model(&self) -> &PoolModel {
-        &self.model
+
+    /// Change the time [`Poller::next_update`] waits between reads.
+    pub fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
     }
-    /// Reads a complete block-pinned image, then publishes it atomically.
-    /// `false` means the returned quote state and block context are unchanged.
+
+    /// The pool as of the last successful read. Its block is
+    /// `pool().snapshot().block.number`.
+    ///
+    /// The pool's prices age even when nothing is read: before quoting, move
+    /// the pool to the block you expect to trade in with [`Pool::at_block`].
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// Read the pool's current state: one request. Returns whether anything
+    /// changed. On an error the previous state stays in place, one block
+    /// older than it was.
     pub async fn refresh(&mut self) -> Result<bool> {
-        let next = snapshot(&self.reader, self.model.state().proxy, CallBlock::Latest).await?;
-        if next.state().block.number < self.model.state().block.number {
-            return Err(Error::ProviderBehind {
-                reported: next.state().block.number,
-                current: self.model.state().block.number,
+        let current: &Snapshot = self.pool.snapshot();
+        let next = read_snapshot(&self.rpc, current.pool, BlockId::Latest, &current.tokens).await?;
+        if next.block.number < current.block.number {
+            return Err(Error::NodeBehind {
+                reported: next.block.number,
+                current: current.block.number,
             });
         }
-        if next.state() == self.model.state() {
+        if next == *current {
             return Ok(false);
         }
-        self.model = next;
+        self.pool = Pool::new(next)?;
         Ok(true)
     }
-    /// Wait one polling interval and refresh once, returning even if unchanged.
-    pub async fn next_update(&mut self) -> Result<&PoolModel> {
-        tokio::time::sleep(self.config.poll_interval).await;
+
+    /// Wait one interval, then [`refresh`](Poller::refresh).
+    pub async fn next_update(&mut self) -> Result<&Pool> {
+        tokio::time::sleep(self.interval).await;
         self.refresh().await?;
-        Ok(&self.model)
+        Ok(&self.pool)
     }
 }

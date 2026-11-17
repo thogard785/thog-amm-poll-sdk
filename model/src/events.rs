@@ -1,333 +1,452 @@
-//! Absolute maker checkpoints plus ERC-20 balance deltas, applied atomically by block.
+//! Advance a snapshot by one block of logs, without reading the chain.
+//!
+//! The rules, event by event, are in
+//! <https://github.com/thogard785/thog-amm-integration-guide/blob/main/REFERENCE.md#keeping-state-current-from-events>
 use crate::{
     abi,
-    math::{add, mask, sub},
-    Address, BlockHeader, Error, PoolState, Result, RpcLog, U256,
+    layout::{self, control, Field, Packed},
+    math::{add, sub, U128_MAX},
+    pool::encode_cap,
+    snapshot::{mask, Block, Snapshot, WMON},
+    Address, Bytes, Error, Result, B256, U256,
 };
 use alloy_sol_types::{sol_data, SolEvent, SolType};
+use serde::{Deserialize, Serialize};
 
-fn decode<E: SolEvent>(log: &RpcLog) -> Result<E> {
-    E::decode_raw_log_validate(log.topics.iter().copied(), &log.data)
-        .map_err(|e| Error::Abi(e.to_string()))
+/// A block header as `eth_getBlockByNumber` and `monadNewHeads` return it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockHeader {
+    #[serde(with = "hex_u64")]
+    pub number: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
+    pub base_fee_per_gas: U256,
 }
-fn invalid() -> Error {
-    Error::InvalidData("invalid schema-8 publication".into())
+
+/// A log as `eth_getLogs` and the `logs` subscription return it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Log {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    pub block_hash: B256,
+    #[serde(with = "hex_u64")]
+    pub block_number: u64,
+    #[serde(with = "hex_u64")]
+    pub transaction_index: u64,
+    #[serde(with = "hex_u64")]
+    pub log_index: u64,
+    #[serde(default)]
+    pub removed: bool,
 }
-fn page(state: &mut PoolState, e: abi::MakerPageUpdated, block: u64) -> Result<()> {
-    let tokens = state.tokens.len();
-    let categories = state.categories.len();
-    let generation = state.bits(8, 184, 32)?;
-    if e.lane == 8 {
-        let (addresses, limits, cats, cat_limits) =
-            <(
-                sol_data::Array<sol_data::Address>,
-                sol_data::Array<sol_data::Uint<256>>,
-                sol_data::Array<sol_data::Uint<8>>,
-                sol_data::Array<sol_data::Uint<256>>,
-            )>::abi_decode_params_validate(&e.payload)
-            .map_err(|e| Error::Abi(e.to_string()))?;
-        if addresses.len() != limits.len() || cats.len() != cat_limits.len() {
-            return Err(invalid());
-        }
-        for (address, limit) in addresses.into_iter().zip(limits) {
-            let i = state
-                .tokens
-                .iter()
-                .position(|t| t.token == address)
-                .ok_or_else(invalid)?;
-            state.set_bits(
-                101 + (i / 10) as u16,
-                i % 10 * 24,
-                24,
-                U256::from(crate::model::encode_cap(limit)),
-            )?;
-        }
-        for (c, limit) in cats.into_iter().zip(cat_limits) {
-            let c = usize::from(c);
-            if c >= categories {
-                return Err(invalid());
-            }
-            state.set_bits(
-                104 + (c / 10) as u16,
-                c % 10 * 24,
-                24,
-                U256::from(crate::model::encode_cap(limit)),
-            )?;
-        }
-    } else {
-        if e.payload.len() % 32 != 0 || e.payload.is_empty() {
-            return Err(invalid());
-        }
-        let words: Vec<U256> = e
-            .payload
-            .chunks_exact(32)
-            .map(U256::from_be_slice)
-            .collect();
-        let h = words[0];
-        let f = |offset: usize, width: usize| (h >> offset) & mask(width);
-        match e.lane {
-            1 => {
-                if words.len() != 1 + tokens.div_ceil(4)
-                    || f(81, 8) != U256::from(tokens)
-                    || f(89, 8) != U256::from(8)
-                    || f(97, 32) != generation
-                    || !(h >> 129usize).is_zero()
-                    || block > u32::MAX as u64
-                {
-                    return Err(invalid());
-                }
-                for (i, word) in words[1..].iter().enumerate() {
-                    state.words.insert(20 + i as u16, *word);
-                }
-                state.set_bits(2, 20, 16, f(0, 16))?;
-                state.set_bits(2, 36, 32, U256::from(block))?;
-                state.set_bits(2, 68, 64, f(17, 64))?;
-                state.set_bits(2, 133, 1, f(16, 1))?;
-            }
-            2 => {
-                if f(0, 8) != U256::from(8)
-                    || f(8, 8) != U256::from(tokens)
-                    || f(16, 8) != U256::from(categories)
-                    || !f(80, 32).is_zero()
-                    || f(112, 32) != state.bits(7, 160, 32)?
-                    || f(144, 32) != generation
-                    || !(h >> 176usize).is_zero()
-                {
-                    return Err(invalid());
-                }
-                let cat_words = categories.div_ceil(3);
-                let covariance_words = (categories * (categories + 1) / 2).div_ceil(16);
-                let policy_words = tokens.div_ceil(5);
-                let pair_words = (tokens * (tokens - 1) / 2).div_ceil(16);
-                if words.len() != 1 + cat_words + covariance_words + policy_words + pair_words {
-                    return Err(invalid());
-                }
-                let mut cursor = 1;
-                for i in 0..cat_words {
-                    state.set_bits(
-                        27 + i as u16,
-                        0,
-                        if i == 9 { 85 } else { 255 },
-                        words[cursor],
-                    )?;
-                    cursor += 1;
-                }
-                for i in 0..covariance_words {
-                    state.words.insert(37 + i as u16, words[cursor]);
-                    cursor += 1;
-                }
-                for i in 0..tokens {
-                    let policy = words[cursor + i / 5] >> (i % 5 * 48);
-                    state.set_bits(9 + (i / 3) as u16, i % 3 * 75 + 15, 16, policy)?;
-                    state.set_bits(9 + (i / 3) as u16, i % 3 * 75 + 43, 32, policy >> 16usize)?;
-                }
-                cursor += policy_words;
-                for i in 0..pair_words {
-                    state.words.insert(63 + i as u16, words[cursor]);
-                    cursor += 1;
-                }
-                state.set_bits(2, 134, 1, U256::ONE)?;
-                state.set_bits(2, 138, 8, f(56, 8))?;
-                state.set_bits(2, 146, 16, f(64, 16))?;
-                state.set_bits(2, 162, 32, f(24, 32))?;
-                state.refresh_categories()?;
-            }
-            4 => {
-                let wrapper_words = tokens.div_ceil(3);
-                if words.len() != 1 + wrapper_words + categories.div_ceil(4)
-                    || f(0, 8) != U256::from(8)
-                    || f(8, 8) != U256::from(tokens)
-                    || f(16, 8) != U256::from(categories)
-                    || !f(24, 8).is_zero()
-                    || f(32, 32) != generation
-                    || !(h >> 64usize).is_zero()
-                {
-                    return Err(invalid());
-                }
-                let mut coefficients = [U256::ZERO; 7];
-                for i in 0..tokens {
-                    let policy = (words[1 + i / 3] >> (i % 3 * 76)) & mask(76);
-                    coefficients[i / 4] |= (policy & mask(64)) << (i % 4 * 64);
-                    state.set_bits(9 + (i / 3) as u16, i % 3 * 75 + 31, 12, policy >> 64usize)?;
-                }
-                for (i, coefficient) in coefficients.iter().enumerate().take(tokens.div_ceil(4)) {
-                    state.words.insert(87 + i as u16, *coefficient);
-                }
-                for i in 0..categories.div_ceil(4) {
-                    state
-                        .words
-                        .insert(94 + i as u16, words[1 + wrapper_words + i]);
-                }
-                state.set_bits(2, 135, 1, U256::ONE)?;
-            }
-            _ => return Err(invalid()),
-        }
+
+mod hex_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let text = String::deserialize(d)?;
+        let digits = text
+            .strip_prefix("0x")
+            .ok_or_else(|| serde::de::Error::custom("expected a 0x-prefixed quantity"))?;
+        u64::from_str_radix(digits, 16).map_err(serde::de::Error::custom)
     }
-    if state.word(2)? != e.control {
-        return Err(Error::InvalidData(
-            "publication control disagrees with replay".into(),
-        ));
+    pub fn serialize<S: Serializer>(value: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("0x{value:x}"))
     }
-    Ok(())
 }
-/// Returns a new image only after every log was checked. Never double-count swap events
-/// alongside Transfer: maker/taker events are inventory checkpoints, not balance deltas.
-pub fn apply_block(previous: &PoolState, block: BlockHeader, logs: &[RpcLog]) -> Result<PoolState> {
-    apply_owned_block(previous.clone(), block, logs)
+
+/// The log filters that together carry every change to the pool's state:
+/// everything the pool emits, token transfers to and from it, and WMON
+/// wrapping by it. Use them for `eth_getLogs` or `eth_subscribe("logs")`.
+pub fn log_filters(pool: Address) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let holder = B256::from(pool.into_word());
+    let transfers = [
+        abi::Transfer::SIGNATURE_HASH,
+        abi::TransferShares::SIGNATURE_HASH,
+    ];
+    let wrapping = [
+        abi::Deposit::SIGNATURE_HASH,
+        abi::Withdrawal::SIGNATURE_HASH,
+    ];
+    vec![
+        json!({ "address": pool }),
+        json!({ "topics": [transfers, holder] }),
+        json!({ "topics": [transfers, null, holder] }),
+        json!({ "address": WMON, "topics": [wrapping, holder] }),
+    ]
 }
-/// Apply a complete block to an owned, unpublished candidate. Ownership avoids
-/// copying the image at each block of a finalized ancestry; failure discards the
-/// candidate, so the caller's published model remains unchanged.
-pub fn apply_owned_block<'a>(
-    mut next: PoolState,
-    block: BlockHeader,
-    logs: impl IntoIterator<Item = &'a RpcLog>,
-) -> Result<PoolState> {
-    if block.number != next.block.number.checked_add(1).ok_or(Error::Arithmetic)?
-        || Some(block.parent_hash) != next.block.hash
+
+/// Apply every log of the block after `snapshot`'s, in order.
+///
+/// `logs` must be all logs of that block matching [`log_filters`], sorted by
+/// position. On any error the block could not be followed exactly: read a
+/// fresh snapshot instead of continuing.
+pub fn apply_block<'a>(
+    mut snapshot: Snapshot,
+    header: &BlockHeader,
+    logs: impl IntoIterator<Item = &'a Log>,
+) -> Result<Snapshot> {
+    if header.number != snapshot.block.number + 1 || Some(header.parent_hash) != snapshot.block.hash
     {
         return Err(Error::Discontinuous);
     }
-    let mut previous_position = None;
+    let mut last_position = None;
     for log in logs {
-        if log.removed || log.block_hash != block.hash || log.block_number != block.number {
+        if log.removed || log.block_hash != header.hash || log.block_number != header.number {
             return Err(Error::Discontinuous);
         }
         let position = (log.transaction_index, log.log_index);
-        if previous_position.is_some_and(|p| p >= position) {
-            return Err(Error::InvalidData("logs must be unique and ordered".into()));
+        if last_position.is_some_and(|last| last >= position) {
+            return Err(invalid("logs are not unique and in order"));
         }
-        previous_position = Some(position);
-        let Some(topic) = log.topics.first() else {
-            continue;
-        };
-        if log.address == next.proxy {
-            if *topic == abi::Upgraded::SIGNATURE_HASH {
-                return Err(Error::ContractUpgraded);
-            }
-            if *topic == abi::MakerTokenAdded::SIGNATURE_HASH
-                || *topic == abi::MakerTokenRetired::SIGNATURE_HASH
-            {
-                // Registry mutations also rewrite policy/matrix rows not included
-                // in these events. A complete new snapshot is required.
-                return Err(Error::RegistryChanged);
-            } else if *topic == abi::MakerPageUpdated::SIGNATURE_HASH {
-                page(
-                    &mut next,
-                    decode::<abi::MakerPageUpdated>(log)?,
-                    block.number,
-                )?;
-            } else if *topic == abi::MakerLendingExposureUpdated::SIGNATURE_HASH {
-                let e = decode::<abi::MakerLendingExposureUpdated>(log)?;
-                let c = usize::from(e.category);
-                if c >= next.categories.len()
-                    || U256::from(e.sequence) != next.bits(7, 160, 32)? + U256::ONE
-                {
-                    return Err(invalid());
-                }
-                next.set_bits(
-                    27 + (c / 3) as u16,
-                    c % 3 * 85,
-                    64,
-                    U256::from(e.offset as u64),
-                )?;
-                next.set_bits(7, 160, 32, U256::from(e.sequence))?;
-            } else if *topic == abi::MakerMultiplierUpdated::SIGNATURE_HASH {
-                let e = decode::<abi::MakerMultiplierUpdated>(log)?;
-                if !crate::shares::is_xstock(e.token)
-                    || e.multiplier.is_zero()
-                    || e.multiplier > mask(128)
-                {
-                    return Err(invalid());
-                }
-                // Anyone may sync a compiled but unlisted stock. It does not
-                // affect the active registry; listing still requires a snapshot.
-                if let Some(holding) = next.share_balances.get_mut(&e.token) {
-                    holding.multiplier = e.multiplier;
-                }
-            } else if *topic == abi::MakerInventoryUpdated::SIGNATURE_HASH {
-                let e = decode::<abi::MakerInventoryUpdated>(log)?;
-                let i = usize::from(e.index);
-                if next.tokens.get(i).map(|t| t.token) != Some(e.token) {
-                    return Err(invalid());
-                }
-                let slot = 107 + (i / 2) as u16;
-                next.set_bits(slot, i % 2 * 128, 128, U256::from(e.balance))?;
-                next.set_bits(121, i / 2, 1, U256::from(next.word(slot)?.is_zero() as u8))?;
-            } else if *topic == abi::MakerWmonBalanceCheckpoint::SIGNATURE_HASH {
-                let i = next
-                    .tokens
-                    .iter()
-                    .position(|t| t.token == crate::state::WMON)
-                    .ok_or_else(invalid)?;
-                next.balances[i] = decode::<abi::MakerWmonBalanceCheckpoint>(log)?.balance;
-            } else if *topic == abi::NativeBalanceCheckpoint::SIGNATURE_HASH {
-                next.native_balance = decode::<abi::NativeBalanceCheckpoint>(log)?.balance;
-            } else if *topic == abi::Paused::SIGNATURE_HASH {
-                next.set_bits(
-                    2,
-                    132,
-                    1,
-                    U256::from(decode::<abi::Paused>(log)?.paused as u8),
-                )?;
-            }
-        } else if let Some(index) = next.tokens.iter().position(|t| t.token == log.address) {
-            if crate::shares::is_xstock(log.address) {
-                if *topic == abi::TransferShares::SIGNATURE_HASH {
-                    let e = decode::<abi::TransferShares>(log)?;
-                    let holding = next
-                        .share_balances
-                        .get_mut(&log.address)
-                        .ok_or_else(invalid)?;
-                    if e.from != e.to {
-                        if e.from == next.proxy {
-                            holding.shares = sub(holding.shares, e.value)?;
-                        }
-                        if e.to == next.proxy {
-                            holding.shares = add(holding.shares, e.value)?;
-                        }
-                    }
-                }
-            } else if *topic == abi::Transfer::SIGNATURE_HASH {
-                let e = decode::<abi::Transfer>(log)?;
-                // Self-transfers are a no-op, even at a uint256 balance boundary.
-                if e.from == e.to {
-                    continue;
-                }
-                if e.from == next.proxy {
-                    next.balances[index] = sub(next.balances[index], e.value)?;
-                }
-                if e.to == next.proxy {
-                    next.balances[index] = add(next.balances[index], e.value)?;
-                }
-            } else if log.address == crate::state::WMON && *topic == abi::Deposit::SIGNATURE_HASH {
-                let e = decode::<abi::Deposit>(log)?;
-                if e.dst == next.proxy {
-                    next.balances[index] = add(next.balances[index], e.wad)?;
-                }
-            } else if log.address == crate::state::WMON && *topic == abi::Withdrawal::SIGNATURE_HASH
-            {
-                let e = decode::<abi::Withdrawal>(log)?;
-                if e.src == next.proxy {
-                    next.balances[index] = sub(next.balances[index], e.wad)?;
-                }
-            }
+        last_position = Some(position);
+        if log.address == snapshot.pool {
+            apply_pool_log(&mut snapshot, log, header.number)?;
+        } else if let Some(index) = snapshot.index_of(log.address) {
+            apply_token_log(&mut snapshot, index, log)?;
         }
     }
-    next.refresh_share_balances()?;
-    next.block = block.into();
-    next.validate()?;
-    Ok(next)
+    // An xStock's balance follows from its shares and the stored multiplier.
+    for index in 0..snapshot.tokens.len() {
+        if let Some(xstock) = &snapshot.xstocks[index] {
+            snapshot.balances[index] = xstock.amount(xstock.shares)?;
+        }
+    }
+    snapshot.block = Block {
+        number: header.number,
+        hash: Some(header.hash),
+        parent_hash: header.parent_hash,
+        base_fee: header.base_fee_per_gas,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
 }
-/// Filters are also used for subscriptions. Transfers cover the proxy in either
-/// indexed position; no hard-coded token list can miss a later listing.
-pub fn log_filters(proxy: Address, wmon: Address) -> Vec<serde_json::Value> {
-    use serde_json::json;
-    let owner = alloy_primitives::B256::from(proxy.into_word());
-    vec![
-        json!({"address":proxy}),
-        json!({"topics":[[abi::Transfer::SIGNATURE_HASH,abi::TransferShares::SIGNATURE_HASH],owner]}),
-        json!({"topics":[[abi::Transfer::SIGNATURE_HASH,abi::TransferShares::SIGNATURE_HASH],null,owner]}),
-        json!({"address":wmon,"topics":[[abi::Deposit::SIGNATURE_HASH,abi::Withdrawal::SIGNATURE_HASH],owner]}),
-    ]
+
+fn apply_pool_log(snapshot: &mut Snapshot, log: &Log, block: u64) -> Result<()> {
+    let Some(topic) = log.topics.first() else {
+        return Ok(());
+    };
+    if *topic == abi::Upgraded::SIGNATURE_HASH {
+        return Err(Error::ContractUpgraded);
+    }
+    if *topic == abi::MakerTokenAdded::SIGNATURE_HASH
+        || *topic == abi::MakerTokenRetired::SIGNATURE_HASH
+    {
+        // A listing change also rewrites spreads and covariance that its
+        // event does not carry.
+        return Err(Error::RegistryChanged);
+    }
+    if *topic == abi::MakerPageUpdated::SIGNATURE_HASH {
+        let event: abi::MakerPageUpdated = decode(log)?;
+        match event.lane {
+            1 => apply_price_update(snapshot, &event.payload, block)?,
+            2 => apply_risk_update(snapshot, &event.payload)?,
+            4 => apply_token_cost_update(snapshot, &event.payload)?,
+            8 => apply_cap_update(snapshot, &event.payload)?,
+            _ => return Err(invalid("unknown update kind")),
+        }
+        // The event carries the control word the update produced.
+        if snapshot.word(control::SLOT) != event.control {
+            return Err(invalid("update does not reproduce the pool's control word"));
+        }
+    } else if *topic == abi::MakerLendingExposureUpdated::SIGNATURE_HASH {
+        let event: abi::MakerLendingExposureUpdated = decode(log)?;
+        let category = usize::from(event.category);
+        if category >= snapshot.category_count()
+            || u64::from(event.sequence) != snapshot.small(layout::OFFSET_SEQUENCE) + 1
+        {
+            return Err(invalid("category offset update out of sequence"));
+        }
+        let (offset, width) = layout::category::OFFSET;
+        snapshot.set_field(
+            layout::CATEGORY.at(category).part(offset, width),
+            U256::from(event.offset as u64),
+        );
+        snapshot.set_field(layout::OFFSET_SEQUENCE, U256::from(event.sequence));
+    } else if *topic == abi::MakerMultiplierUpdated::SIGNATURE_HASH {
+        let event: abi::MakerMultiplierUpdated = decode(log)?;
+        if event.multiplier.is_zero() || event.multiplier > U128_MAX {
+            return Err(invalid("multiplier out of range"));
+        }
+        // Anyone may sync a stock the pool does not list; that changes nothing here.
+        if let Some(index) = snapshot.index_of(event.token) {
+            snapshot.xstocks[index]
+                .as_mut()
+                .ok_or_else(|| invalid("multiplier update for an ordinary token"))?
+                .multiplier = event.multiplier;
+        }
+    } else if *topic == abi::MakerInventoryUpdated::SIGNATURE_HASH {
+        let event: abi::MakerInventoryUpdated = decode(log)?;
+        let index = usize::from(event.index);
+        if snapshot.tokens.get(index) != Some(&event.token) {
+            return Err(invalid("recorded balance update for another token"));
+        }
+        set_recorded_units(snapshot, index, U256::from(event.balance));
+    } else if *topic == abi::MakerWmonBalanceCheckpoint::SIGNATURE_HASH {
+        let event: abi::MakerWmonBalanceCheckpoint = decode(log)?;
+        let index = snapshot
+            .index_of(WMON)
+            .ok_or_else(|| invalid("WMON is not listed"))?;
+        snapshot.balances[index] = event.balance;
+    } else if *topic == abi::NativeBalanceCheckpoint::SIGNATURE_HASH {
+        let event: abi::NativeBalanceCheckpoint = decode(log)?;
+        snapshot.native_balance = event.balance;
+    } else if *topic == abi::Paused::SIGNATURE_HASH {
+        let event: abi::Paused = decode(log)?;
+        snapshot.set_field(control::PAUSED, U256::from(event.paused as u8));
+    }
+    Ok(())
+}
+
+fn apply_token_log(snapshot: &mut Snapshot, index: usize, log: &Log) -> Result<()> {
+    let Some(topic) = log.topics.first() else {
+        return Ok(());
+    };
+    let pool = snapshot.pool;
+    // Amount entering and leaving the pool; a transfer to itself moves nothing.
+    let moved = |from: Address, to: Address, value: U256| {
+        if from == to {
+            (U256::ZERO, U256::ZERO)
+        } else {
+            (
+                if to == pool { value } else { U256::ZERO },
+                if from == pool { value } else { U256::ZERO },
+            )
+        }
+    };
+    if let Some(xstock) = &mut snapshot.xstocks[index] {
+        // An xStock emits both events for one movement. Only the share event
+        // is exact, so the ordinary Transfer is skipped.
+        if *topic == abi::TransferShares::SIGNATURE_HASH {
+            let event: abi::TransferShares = decode(log)?;
+            let (received, sent) = moved(event.from, event.to, event.value);
+            xstock.shares = sub(add(xstock.shares, received)?, sent)?;
+        }
+        return Ok(());
+    }
+    let (received, sent) = if *topic == abi::Transfer::SIGNATURE_HASH {
+        let event: abi::Transfer = decode(log)?;
+        moved(event.from, event.to, event.value)
+    } else if log.address == WMON && *topic == abi::Deposit::SIGNATURE_HASH {
+        let event: abi::Deposit = decode(log)?;
+        moved(Address::ZERO, event.dst, event.wad)
+    } else if log.address == WMON && *topic == abi::Withdrawal::SIGNATURE_HASH {
+        let event: abi::Withdrawal = decode(log)?;
+        moved(event.src, Address::ZERO, event.wad)
+    } else {
+        return Ok(());
+    };
+    snapshot.balances[index] = sub(add(snapshot.balances[index], received)?, sent)?;
+    Ok(())
+}
+
+/// Store a recorded balance. Bit `i` of slot 121 says that word `i` of the
+/// recorded balances is zero.
+pub(crate) fn set_recorded_units(snapshot: &mut Snapshot, index: usize, units: U256) {
+    let field = layout::RECORDED_UNITS.at(index);
+    snapshot.set_field(field, units);
+    let word_is_zero = snapshot.word(field.slot).is_zero();
+    snapshot.set_field(
+        Field::new(
+            layout::RECORDED_ZERO_SLOT,
+            usize::from(field.slot - layout::RECORDED_UNITS.first_slot),
+            1,
+        ),
+        U256::from(word_is_zero as u8),
+    );
+}
+
+// The payload of a MakerPageUpdated event is a header word followed by the
+// new values, packed like the storage they replace. The header repeats the
+// token and category counts and the registry generation it was built for.
+
+/// The 32-byte words of an update payload.
+fn payload_words(payload: &[u8]) -> Result<Vec<U256>> {
+    if payload.is_empty() || payload.len() % 32 != 0 {
+        return Err(invalid("update payload is not whole words"));
+    }
+    Ok(payload.chunks_exact(32).map(U256::from_be_slice).collect())
+}
+
+fn bits(word: U256, offset: usize, width: usize) -> U256 {
+    (word >> offset) & mask(width)
+}
+
+/// Replace `count` fields of a packed array with whole payload words.
+fn replace_words(snapshot: &mut Snapshot, array: Packed, count: usize, words: &[U256]) {
+    for (index, word) in words.iter().take(array.words(count)).enumerate() {
+        snapshot.set_word(array.first_slot + index as u16, *word);
+    }
+}
+
+/// Kind 1: every token's price, the per-token switches, and the price block.
+fn apply_price_update(snapshot: &mut Snapshot, payload: &[u8], block: u64) -> Result<()> {
+    let words = payload_words(payload)?;
+    let header = words[0];
+    let tokens = snapshot.token_count();
+    if words.len() != 1 + layout::PRICE.words(tokens)
+        || bits(header, 81, 8) != U256::from(tokens)
+        || bits(header, 89, 8) != U256::from(8)
+        || bits(header, 97, 32) != snapshot.field(layout::REGISTRY_GENERATION)
+        || !(header >> 129usize).is_zero()
+        || block > u64::from(u32::MAX)
+    {
+        return Err(invalid("price update"));
+    }
+    replace_words(snapshot, layout::PRICE, tokens, &words[1..]);
+    snapshot.set_field(control::PRICE_SEQUENCE, bits(header, 0, 16));
+    snapshot.set_field(control::PRICES_ENABLED, bits(header, 16, 1));
+    snapshot.set_field(control::SIDES, bits(header, 17, 64));
+    snapshot.set_field(control::PRICE_BLOCK, U256::from(block));
+    Ok(())
+}
+
+/// Kind 2: category spreads and offsets, covariance, token spreads and size
+/// rates, pair spreads, and the pool-wide age and risk parameters.
+fn apply_risk_update(snapshot: &mut Snapshot, payload: &[u8]) -> Result<()> {
+    let words = payload_words(payload)?;
+    let header = words[0];
+    let tokens = snapshot.token_count();
+    let categories = snapshot.category_count();
+    let category_words = layout::CATEGORY.words(categories);
+    let covariance_words = layout::COVARIANCE.words(categories * (categories + 1) / 2);
+    let token_words = tokens.div_ceil(5);
+    let pair_words = layout::PAIR_SPREAD.words(tokens * (tokens - 1) / 2);
+    if bits(header, 0, 8) != U256::from(8)
+        || bits(header, 8, 8) != U256::from(tokens)
+        || bits(header, 16, 8) != U256::from(categories)
+        || !bits(header, 80, 32).is_zero()
+        || bits(header, 112, 32) != snapshot.field(layout::OFFSET_SEQUENCE)
+        || bits(header, 144, 32) != snapshot.field(layout::REGISTRY_GENERATION)
+        || !(header >> 176usize).is_zero()
+        || words.len() != 1 + category_words + covariance_words + token_words + pair_words
+    {
+        return Err(invalid("risk update"));
+    }
+    let (categories_at, covariance_at) = (1, 1 + category_words);
+    let tokens_at = covariance_at + covariance_words;
+    let pairs_at = tokens_at + token_words;
+    // Category records fill the low 255 bits of a word; the last storage word
+    // of the array holds a single record.
+    for index in 0..category_words {
+        let slot = layout::CATEGORY.first_slot + index as u16;
+        let width = if slot + 1 == layout::COVARIANCE.first_slot {
+            layout::CATEGORY.width
+        } else {
+            255
+        };
+        snapshot.set_field(Field::new(slot, 0, width), words[categories_at + index]);
+    }
+    replace_words(
+        snapshot,
+        layout::COVARIANCE,
+        categories * (categories + 1) / 2,
+        &words[covariance_at..],
+    );
+    // Five 48-bit entries per word: spread in, spread out, size rate.
+    for index in 0..tokens {
+        let entry = words[tokens_at + index / 5] >> (index % 5 * 48);
+        let record = layout::TOKEN.at(index);
+        let (offset, width) = layout::token::SPREAD_IN;
+        snapshot.set_field(record.part(offset, width), entry);
+        // Spread out and size rate are adjacent in storage.
+        let (offset, _) = layout::token::SPREAD_OUT;
+        snapshot.set_field(record.part(offset, 32), entry >> 16usize);
+    }
+    replace_words(
+        snapshot,
+        layout::PAIR_SPREAD,
+        tokens * (tokens - 1) / 2,
+        &words[pairs_at..],
+    );
+    snapshot.set_field(control::RISK_AVERSION, bits(header, 24, 32));
+    snapshot.set_field(control::MAX_PRICE_AGE, bits(header, 56, 8));
+    snapshot.set_field(control::SPREAD_PER_BLOCK, bits(header, 64, 16));
+    snapshot.set_field(control::RISK_READY, U256::ONE);
+    Ok(())
+}
+
+/// Kind 4: every token's cost and every category's target.
+fn apply_token_cost_update(snapshot: &mut Snapshot, payload: &[u8]) -> Result<()> {
+    let words = payload_words(payload)?;
+    let header = words[0];
+    let tokens = snapshot.token_count();
+    let categories = snapshot.category_count();
+    let cost_words = tokens.div_ceil(3);
+    if bits(header, 0, 8) != U256::from(8)
+        || bits(header, 8, 8) != U256::from(tokens)
+        || bits(header, 16, 8) != U256::from(categories)
+        || !bits(header, 24, 8).is_zero()
+        || bits(header, 32, 32) != snapshot.field(layout::REGISTRY_GENERATION)
+        || !(header >> 64usize).is_zero()
+        || words.len() != 1 + cost_words + layout::CATEGORY_TARGET.words(categories)
+    {
+        return Err(invalid("token cost update"));
+    }
+    // Three 76-bit entries per word: coefficient, kind, refund. Unlisted
+    // positions of the last coefficient word are cleared.
+    for word in 0..layout::COST_COEFFICIENT.words(tokens) {
+        snapshot.set_word(
+            layout::COST_COEFFICIENT.first_slot + word as u16,
+            U256::ZERO,
+        );
+    }
+    for index in 0..tokens {
+        let entry = bits(words[1 + index / 3], index % 3 * 76, 76);
+        snapshot.set_field(layout::COST_COEFFICIENT.at(index), entry);
+        // Kind and refund are adjacent in storage.
+        let (offset, _) = layout::token::COST_KIND;
+        snapshot.set_field(layout::TOKEN.at(index).part(offset, 12), entry >> 64usize);
+    }
+    replace_words(
+        snapshot,
+        layout::CATEGORY_TARGET,
+        categories,
+        &words[1 + cost_words..],
+    );
+    snapshot.set_field(control::TOKEN_COSTS_READY, U256::ONE);
+    Ok(())
+}
+
+/// Kind 8: caps for the named tokens and categories; others keep theirs.
+fn apply_cap_update(snapshot: &mut Snapshot, payload: &[u8]) -> Result<()> {
+    type Caps = (
+        sol_data::Array<sol_data::Address>,
+        sol_data::Array<sol_data::Uint<256>>,
+        sol_data::Array<sol_data::Uint<8>>,
+        sol_data::Array<sol_data::Uint<256>>,
+    );
+    let (tokens, token_caps, categories, category_caps) =
+        Caps::abi_decode_params_validate(payload).map_err(|e| Error::Abi(e.to_string()))?;
+    if tokens.len() != token_caps.len() || categories.len() != category_caps.len() {
+        return Err(invalid("cap update"));
+    }
+    for (token, cap) in tokens.into_iter().zip(token_caps) {
+        let index = snapshot
+            .index_of(token)
+            .ok_or_else(|| invalid("cap for an unlisted token"))?;
+        snapshot.set_field(layout::TOKEN_CAP.at(index), U256::from(encode_cap(cap)));
+    }
+    for (category, cap) in categories.into_iter().zip(category_caps) {
+        let category = usize::from(category);
+        if category >= snapshot.category_count() {
+            return Err(invalid("cap for an unknown category"));
+        }
+        snapshot.set_field(
+            layout::CATEGORY_CAP.at(category),
+            U256::from(encode_cap(cap)),
+        );
+    }
+    Ok(())
+}
+
+fn decode<E: SolEvent>(log: &Log) -> Result<E> {
+    E::decode_raw_log_validate(log.topics.iter().copied(), &log.data)
+        .map_err(|e| Error::Abi(e.to_string()))
+}
+
+fn invalid(what: &str) -> Error {
+    Error::InvalidSnapshot(what.into())
 }
