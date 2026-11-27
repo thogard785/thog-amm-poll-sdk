@@ -68,6 +68,11 @@ fn run(name: &str) -> (usize, usize) {
 }
 
 #[test]
+fn deployed_pool_with_eighteen_tokens() {
+    assert_eq!(run("deployed-18.json.gz"), (18 * 17 * 12, 1816));
+}
+
+#[test]
 fn deployed_pool_with_seventeen_tokens() {
     assert_eq!(
         run("deployed-stored-multipliers.json.gz"),

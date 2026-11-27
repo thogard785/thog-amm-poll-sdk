@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "thogamm"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "thogamm-poll"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "flate2",
  "serde_json",
