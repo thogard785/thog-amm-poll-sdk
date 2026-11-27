@@ -7,7 +7,7 @@ try thousands of amounts without a network call.
 
 - Network: Monad mainnet, chain ID 143
 - Pool: `0x80c74517BCC2D67fFE02D3ED886796272F647210`
-- Supports implementation `0xb108a1daf3c9ba52778b97a15ebdfa3f6f59b506`
+- Supports implementation `0xf83c81c62c4cc1942003983919c03f5fd06d3eb4`
 - Rust 1.88 or later
 
 New to ThogAMM? Read the
@@ -19,7 +19,7 @@ the [event SDK](https://github.com/thogard785/thog-amm-event-sdk).
 
 ```toml
 [dependencies]
-thogamm-poll = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.7.0" }
+thogamm-poll = { git = "https://github.com/thogard785/thog-amm-poll-sdk", tag = "v0.7.1" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -135,7 +135,7 @@ specifies what this code implements, section for file.
 cargo test --workspace --release
 ```
 
-The tests replay 61,920 calls recorded from the contract (quotes, marginal
+The tests replay 65,592 calls recorded from the contract (quotes, marginal
 prices, limits, swaps at every surcharge tier, exact-output swaps) and require
 the same integers, and a rejection wherever the contract reverted. They also
 replay 250 recorded blocks of logs and compare the result with the state read
